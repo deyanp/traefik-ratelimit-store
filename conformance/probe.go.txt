@@ -1,0 +1,74 @@
+// Drives the Rust store with go-redis configured exactly as the rate limiter does,
+// so the handshake, the NOSCRIPT/EVAL exchange and the reply shape are proven against
+// the real client rather than against an assumption about it.
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/traefik/traefik/v3/pkg/middlewares/ratelimiter"
+)
+
+const redisPrefix = "rate:"
+
+func main() {
+	ctx := context.Background()
+
+	// The same construction the rate limiter performs: one endpoint, no MasterName,
+	// so this resolves to a plain client on RESP3-by-default.
+	client := redis.NewUniversalClient(&redis.UniversalOptions{
+		Addrs:        []string{"127.0.0.1:16379"},
+		DialTimeout:  200 * time.Millisecond,
+		ReadTimeout:  200 * time.Millisecond,
+		WriteTimeout: 200 * time.Millisecond,
+		PoolSize:     2,
+	})
+
+	rate := 3.0
+	burst := int64(10)
+	ttl := 2
+	maxDelay := (500 * time.Millisecond).Microseconds()
+	key := redisPrefix + "default-rate-limits-probe@kubernetescrd:203.0.113.9"
+
+	script, _ := ratelimiter.LoadTokenBucketScript()
+
+	failures := 0
+	for attempt := 1; attempt <= 12; attempt++ {
+		params := []any{
+			float64(rate / 1000000),
+			burst,
+			ttl,
+			time.Now().UnixMicro(),
+			maxDelay,
+		}
+
+		v, err := script.Run(ctx, client, []string{key}, params...).Result()
+		if err != nil {
+			fmt.Printf("attempt %2d: ERROR %v\n", attempt, err)
+			failures++
+			continue
+		}
+
+		values := v.([]any)
+		ok, errBool := strconv.ParseBool(values[0].(string))
+		delay, errFloat := strconv.ParseFloat(values[1].(string), 64)
+		if errBool != nil || errFloat != nil {
+			fmt.Printf("attempt %2d: UNPARSEABLE %v (%v / %v)\n", attempt, values, errBool, errFloat)
+			failures++
+			continue
+		}
+
+		fmt.Printf("attempt %2d: ok=%v delay=%.0fus tokens=%s\n", attempt, ok, delay, values[2])
+	}
+
+	if failures > 0 {
+		fmt.Printf("\nFAILED: %d of 12 attempts errored\n", failures)
+		os.Exit(1)
+	}
+	fmt.Println("\nPASSED: go-redis drove the store end to end")
+}

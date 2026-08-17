@@ -1,0 +1,139 @@
+//! Startup configuration.
+//!
+//! Built once from a map the caller supplies, never by reading the process environment
+//! directly — so tests construct the same shape by hand and exercise the same factory.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use crate::store::StoreConfig;
+
+/// Everything the binary needs to run, resolved at startup.
+#[derive(Clone, Debug)]
+pub struct AppEnv {
+    pub app_name: String,
+    /// A stable identity for this replica, used to discard its own peer reports.
+    pub replica_id: String,
+    /// Address the rate-limit protocol listener binds to.
+    pub listen_address: String,
+    /// Address the peer endpoint binds to.
+    pub peer_listen_address: String,
+    /// Either a DNS name resolving to every peer, or a comma-separated list of addresses.
+    /// Empty means this replica counts alone.
+    pub peer_endpoint: String,
+    /// How often this replica publishes its consumption to peers.
+    pub peer_publish_interval: Duration,
+    /// How long a peer's report stays usable after it arrives.
+    pub peer_staleness_limit: Duration,
+    /// How long a single delivery may take before it is abandoned.
+    pub peer_request_timeout: Duration,
+    pub store: StoreConfig,
+}
+
+fn read_optional(env_vars: &HashMap<String, String>, name: &str) -> Option<String> {
+    env_vars
+        .get(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_or_default(env_vars: &HashMap<String, String>, name: &str, fallback: &str) -> String {
+    read_optional(env_vars, name).unwrap_or_else(|| fallback.to_string())
+}
+
+fn read_duration_millis(env_vars: &HashMap<String, String>, name: &str, fallback: u64) -> Duration {
+    let millis = read_optional(env_vars, name)
+        .map(|value| {
+            value.parse::<u64>().unwrap_or_else(|_| {
+                panic!("Environment variable {name} must be a whole number of milliseconds!")
+            })
+        })
+        .unwrap_or(fallback);
+
+    Duration::from_millis(millis)
+}
+
+fn read_usize(env_vars: &HashMap<String, String>, name: &str, fallback: usize) -> usize {
+    read_optional(env_vars, name)
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("Environment variable {name} must be a whole number!"))
+        })
+        .unwrap_or(fallback)
+}
+
+impl AppEnv {
+    pub fn create(env_vars: &HashMap<String, String>) -> Self {
+        // The hostname is stable for a pod's lifetime and unique within a deployment,
+        // which is all the replica identity has to be.
+        let replica_id = read_optional(env_vars, "REPLICA_ID")
+            .or_else(|| read_optional(env_vars, "HOSTNAME"))
+            .unwrap_or_else(|| "replica".to_string());
+
+        Self {
+            app_name: read_or_default(env_vars, "APPNAME", "traefik-ratelimit-store"),
+            replica_id,
+            listen_address: read_or_default(env_vars, "LISTEN_ADDRESS", "0.0.0.0:6379"),
+            peer_listen_address: read_or_default(env_vars, "PEER_LISTEN_ADDRESS", "0.0.0.0:8080"),
+            peer_endpoint: read_or_default(env_vars, "PEER_ENDPOINT", ""),
+            peer_publish_interval: read_duration_millis(env_vars, "PEER_PUBLISH_INTERVAL_MS", 150),
+            peer_staleness_limit: read_duration_millis(env_vars, "PEER_STALENESS_LIMIT_MS", 1_000),
+            peer_request_timeout: read_duration_millis(env_vars, "PEER_REQUEST_TIMEOUT_MS", 50),
+            store: StoreConfig {
+                shard_count: read_usize(env_vars, "STORE_SHARD_COUNT", 16),
+                capacity_per_shard: read_usize(env_vars, "STORE_CAPACITY_PER_SHARD", 65_536),
+                sweep_interval: read_duration_millis(env_vars, "STORE_SWEEP_INTERVAL_MS", 1_000),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_apply_when_nothing_is_configured() {
+        let env = AppEnv::create(&HashMap::new());
+
+        assert_eq!(env.listen_address, "0.0.0.0:6379");
+        assert_eq!(env.peer_publish_interval, Duration::from_millis(150));
+        assert_eq!(env.store.shard_count, 16);
+        assert!(env.peer_endpoint.is_empty());
+    }
+
+    #[test]
+    fn a_blank_value_counts_as_unset() {
+        // An unset variable injected by an orchestrator arrives as an empty string.
+        let env_vars = HashMap::from([("LISTEN_ADDRESS".to_string(), "   ".to_string())]);
+
+        let env = AppEnv::create(&env_vars);
+
+        assert_eq!(env.listen_address, "0.0.0.0:6379");
+    }
+
+    #[test]
+    fn replica_id_falls_back_to_the_hostname() {
+        let env_vars = HashMap::from([("HOSTNAME".to_string(), "store-7c9d-abcde".to_string())]);
+
+        let env = AppEnv::create(&env_vars);
+
+        assert_eq!(env.replica_id, "store-7c9d-abcde");
+    }
+
+    #[test]
+    fn explicit_values_are_taken() {
+        let env_vars = HashMap::from([
+            ("PEER_ENDPOINT".to_string(), "peers.svc:8080".to_string()),
+            ("PEER_PUBLISH_INTERVAL_MS".to_string(), "250".to_string()),
+            ("STORE_SHARD_COUNT".to_string(), "32".to_string()),
+        ]);
+
+        let env = AppEnv::create(&env_vars);
+
+        assert_eq!(env.peer_endpoint, "peers.svc:8080");
+        assert_eq!(env.peer_publish_interval, Duration::from_millis(250));
+        assert_eq!(env.store.shard_count, 32);
+    }
+}

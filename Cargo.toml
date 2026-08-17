@@ -1,0 +1,27 @@
+[package]
+name      = "traefik-ratelimit-store"
+edition   = "2024"
+version   = "0.1.0"
+autotests = false
+
+[dependencies]
+tokio              = { version = "1.53", features = ["full"] }
+axum               = "0.8"
+# Peer traffic is plain in-cluster HTTP, so no TLS backend is pulled in.
+reqwest            = { version = "0.13", default-features = false, features = ["json"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+sha1               = "0.11"
+hex                = "0.4"
+dotenvy            = "0.15"
+
+[dev-dependencies]
+cucumber = "0.23"
+# Executes the reference Lua so the native arithmetic can be diffed against it. Test-only:
+# the shipped binary contains no interpreter, which is the whole point of implementing the
+# bucket natively. Lua 5.1 specifically — the script uses `table.maxn`, removed in 5.2.
+mlua     = { version = "0.12", features = ["lua51", "vendored"] }
+
+# The cucumber World is declared here once tests/main.rs exists.

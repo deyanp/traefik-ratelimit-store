@@ -1,0 +1,37 @@
+This product includes software developed by Traefik Labs.
+
+`src/script.rs` embeds, verbatim, the Lua token-bucket script published in
+Traefik Proxy at `pkg/middlewares/ratelimiter/lua.go`. The copies exist to be
+compared against what a caller sends, so that a change to the upstream algorithm
+is detected rather than silently served with stale semantics. They are never
+executed by this program.
+
+Two revisions are embedded, because the text changed between releases while the
+algorithm did not:
+
+  - PINNED_SCRIPT               as published in Traefik v3.7.1
+  - PINNED_SCRIPT_SPACED_RETURN as published later on the Traefik v3.7 branch
+
+Traefik Proxy is distributed under the MIT License:
+
+    The MIT License (MIT)
+
+    Copyright (c) 2016-2020 Containous SAS; 2020-2025 Traefik Labs
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
