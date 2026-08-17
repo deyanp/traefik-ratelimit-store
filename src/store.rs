@@ -519,6 +519,45 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_requests_on_one_key_admit_exactly_the_burst() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The property the whole store rests on. Every other test drives it from one
+        // thread, which cannot distinguish a correct lock from no lock at all: a bucket
+        // whose read-modify-write interleaves is not a rate limit, it is a suggestion.
+        let start = Instant::now();
+        let store = Arc::new(BucketStore::new(StoreConfig::default()));
+        let key = KeyHash::from_key(b"rate:mw:contended");
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let max_delay = 166_666.0;
+
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let store = store.clone();
+                let admitted = admitted.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let outcome =
+                            store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
+                        if outcome.wait <= max_delay {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().expect("no thread may panic");
+        }
+
+        // 800 requests at one instant against a burst of 10. Exactly the burst is
+        // admitted; anything more means increments were lost between threads.
+        assert_eq!(admitted.load(Ordering::Relaxed), BURST as usize);
+    }
+
+    #[test]
     fn hashing_is_stable_and_distinguishes_keys() {
         assert_eq!(KeyHash::from_key(b"same"), KeyHash::from_key(b"same"));
         assert_ne!(KeyHash::from_key(b"one"), KeyHash::from_key(b"two"));
