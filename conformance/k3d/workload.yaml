@@ -1,0 +1,78 @@
+# A backend, and the Middleware CRD that points Traefik's rate limiter at the store.
+#
+# This is the path the Docker-only test cannot reach: the middleware is built by the
+# Kubernetes CRD provider, which maps traefikv1alpha1.Redis onto dynamic.Redis and applies
+# its own defaults, rather than being read straight from a dynamic configuration file.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whoami
+  template:
+    metadata:
+      labels:
+        app: whoami
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami
+          ports:
+            - containerPort: 80
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: default
+spec:
+  selector:
+    app: whoami
+  ports:
+    - port: 80
+
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limits-e2e
+  namespace: default
+spec:
+  rateLimit:
+    average: 30
+    period: 10s
+    burst: 5
+    redis:
+      # Exactly one endpoint: more than one makes Traefik build a cluster client that
+      # immediately asks for CLUSTER SLOTS.
+      endpoints:
+        - traefik-ratelimit-store.default.svc.cluster.local:6379
+      db: 0
+      poolSize: 2
+      maxActiveConns: 5
+      dialTimeout: 200ms
+      readTimeout: 200ms
+      writeTimeout: 200ms
+
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: whoami
+  namespace: default
+spec:
+  entryPoints: [web]
+  routes:
+    - match: PathPrefix(`/`)
+      kind: Rule
+      middlewares:
+        - name: rate-limits-e2e
+      services:
+        - name: whoami
+          port: 80

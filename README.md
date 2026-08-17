@@ -139,6 +139,26 @@ refused  (429): 15
 PASSED: real Traefik enforced a shared limit through this store
 ```
 
+**`conformance/k3d/run.sh` — the production shape.** Stands up a throwaway k3d cluster and
+proves three store replicas enforce one shared limit behind real Traefik. This is the only
+test that covers the Kubernetes CRD provider, which builds the middleware from a `Middleware`
+resource rather than from a configuration file, and peer discovery through a headless
+Service rather than a hardcoded list. It applies the manifests in `deploy/` as written.
+
+Three replicas is what makes the result meaningful: without shared counters a burst of five
+would admit up to fifteen.
+
+```
+Store replicas:   3
+Peer addresses:   10.42.1.3 10.42.2.2 10.42.0.3
+admitted (200): 6
+refused  (429): 14
+PASSED: 3 replicas enforced one shared limit behind real Traefik
+```
+
+The cluster is deleted afterwards and the kubectl context is never switched, so an existing
+session is left alone. Pass `--keepCluster true` to inspect it.
+
 **`conformance/probe.go.txt` — the client's own view.** Drives a running store with
 go-redis configured exactly as the rate limiter configures it. Copy it into a Traefik
 checkout as `conformance-probe/main.go`, start the store on `127.0.0.1:16379`, and `go run
