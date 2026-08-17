@@ -4,6 +4,7 @@ pub mod commands;
 #[cfg(test)]
 mod conformance;
 pub mod errors;
+pub mod health;
 pub mod log_events;
 pub mod logging;
 pub mod mesh;

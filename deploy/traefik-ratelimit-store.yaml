@@ -71,8 +71,10 @@ spec:
               app: traefik-ratelimit-store
       # A hung replica is worse than a dead one: the client does not retry a timeout, so it
       # becomes a 500 where a closed connection would have been retried onto a healthy
-      # replica. Draining closes connections rather than letting them stall.
-      terminationGracePeriodSeconds: 15
+      # replica. On SIGTERM the process fails readiness, keeps serving for its drain
+      # period, then exits — so connections are closed rather than left to stall, and this
+      # must stay longer than that drain period.
+      terminationGracePeriodSeconds: 20
       containers:
         - name: store
           image: traefik-ratelimit-store:0.1.0
@@ -116,15 +118,22 @@ spec:
               cpu: "50m"
             limits:
               memory: "128Mi"
+          # Readiness answers for the RESP port by connecting to it, so a replica whose
+          # protocol listener has stopped leaves the rotation even though the endpoint
+          # serving this probe is still healthy. It also fails immediately on SIGTERM, so
+          # the replica is withdrawn before its listener closes — which is the whole point
+          # of the grace period below.
           readinessProbe:
             httpGet:
               path: /readiness
               port: peers
             periodSeconds: 5
             failureThreshold: 2
+          # Deliberately a different endpoint. Pointing liveness at readiness would make a
+          # draining replica look dead and get it killed part-way through the drain.
           livenessProbe:
             httpGet:
-              path: /readiness
+              path: /health
               port: peers
             periodSeconds: 10
             failureThreshold: 3

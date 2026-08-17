@@ -13,11 +13,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::app_env::AppEnv;
 use crate::errors::TechnicalError;
+use crate::health::Health;
 use crate::log_events;
 use crate::peers::{PeerReport, PeerTable};
 use crate::store::BucketStore;
@@ -125,6 +128,7 @@ pub async fn run_publisher(store: Arc<BucketStore>, peers: Arc<PeerTable>, app_e
 struct PeerEndpointState {
     peers: Arc<PeerTable>,
     replica_id: String,
+    health: Arc<Health>,
 }
 
 async fn receive_report(State(state): State<PeerEndpointState>, Json(report): Json<PeerReport>) {
@@ -133,20 +137,52 @@ async fn receive_report(State(state): State<PeerEndpointState>, Json(report): Js
         .record(&state.replica_id, report, Instant::now());
 }
 
-async fn readiness() -> &'static str {
-    "ready"
+/// Whether this replica should be restarted. Deliberately trivial: anything that can
+/// restart a pod should be as close to "the process exists" as possible, because a clever
+/// liveness probe causes restart loops under exactly the load it was meant to survive.
+async fn liveness() -> &'static str {
+    "alive"
+}
+
+/// Whether this replica should be sent traffic.
+///
+/// Answers for the protocol port rather than for itself: a replica whose protocol listener
+/// has stopped but whose peer endpoint still answers must leave the rotation, and a probe
+/// that only proves it can answer its own probe proves nothing.
+async fn readiness(State(state): State<PeerEndpointState>) -> Response {
+    if state.health.is_draining() {
+        // Said before the listener closes, so the orchestrator withdraws this replica
+        // while it can still finish the connections it already holds.
+        return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
+    }
+
+    if state.health.protocol_listener_answers().await {
+        (StatusCode::OK, "ready").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "protocol listener is not answering",
+        )
+            .into_response()
+    }
 }
 
 /// Serves the peer endpoint until the process ends.
 pub async fn run_peer_endpoint(
     peers: Arc<PeerTable>,
     replica_id: String,
+    health: Arc<Health>,
     listen_address: &str,
 ) -> Result<(), TechnicalError> {
     let app = Router::new()
         .route(REPORT_PATH, post(receive_report))
+        .route("/health", get(liveness))
         .route("/readiness", get(readiness))
-        .with_state(PeerEndpointState { peers, replica_id });
+        .with_state(PeerEndpointState {
+            peers,
+            replica_id,
+            health,
+        });
 
     let listener = tokio::net::TcpListener::bind(listen_address)
         .await
