@@ -10,10 +10,10 @@ Traefik's in-memory rate limiter keeps one bucket map per *router*, not per midd
 and reclaims expired entries only once a map is full. On a large routing table that means
 memory that grows all day and effective limits many times looser than configured.
 
-Those are being fixed upstream. What upstream does not fix is that the in-memory limiter
-is per-pod: run Traefik as a DaemonSet and the effective limit is multiplied by the node
-count. Traefik's only answer to cross-pod state is "configure Redis", and this is that
-Redis-shaped thing without the Redis.
+Both are reported upstream ([#13704], [#13706]). What upstream does not fix is that the
+in-memory limiter is per-pod: run Traefik as a DaemonSet and the effective limit is
+multiplied by the node count. Traefik's only answer to cross-pod state is "configure
+Redis", and this is that Redis-shaped thing without the Redis.
 
 Dividing the configured limit by the node count is not a substitute. A load balancer
 hashes the connection and HTTP keep-alive pins a client to one proxy pod, so one client is
@@ -52,6 +52,25 @@ different digest. A fleet part-way through an upgrade sends both. Comparison sta
 exact-match — normalising whitespace would also make it blind to a real change, which is
 the one thing the check exists to catch.
 
+## How replicas share counters
+
+Replicas broadcast **consumption**, not bucket state. Bucket state does not merge: taking
+the newest or largest of two `(last, tokens)` pairs discards one replica's increments,
+which is the over-admission the sharing exists to prevent. Counts add, so they merge.
+
+Every replica sends its own report to every peer each interval — a full mesh, not a gossip
+protocol. At a handful of replicas that is simpler and one hop rather than several rounds.
+Because a replica only ever publishes its own consumption, each entry in the peer table has
+exactly one author, so arriving reports overwrite rather than combine and there is no merge
+logic at all.
+
+A peer that stops reporting ages out of the staleness window and stops counting, so losing
+one degrades to "count alone" rather than to a wrong answer.
+
+**Accuracy.** Overshoot is bounded by `(N−1) × rate × interval`. At three replicas, three
+requests per second and a 150ms interval that is under one request. The bound scales with
+the configured rate, so a high-rate middleware needs a shorter interval.
+
 ## Configuration
 
 Everything has a working default; nothing is required.
@@ -63,6 +82,9 @@ Everything has a working default; nothing is required.
 | `PEER_ENDPOINT` | *(empty)* | DNS name resolving to all peers, or a comma-separated list. Empty means this replica counts alone |
 | `PEER_PUBLISH_INTERVAL_MS` | `150` | How often consumption is published to peers |
 | `PEER_STALENESS_LIMIT_MS` | `1000` | How long a peer's report stays usable |
+| `PEER_REQUEST_TIMEOUT_MS` | `50` | How long a single delivery may take before it is abandoned |
+| `PEER_MAX_KEYS_PER_REPORT` | `10000` | Most keys a report carries, busiest first |
+| `PEER_SHARED_SECRET` | *(empty)* | Bearer token peers must present. Empty means unauthenticated |
 | `STORE_SHARD_COUNT` | `16` | Independently locked shards |
 | `STORE_CAPACITY_PER_SHARD` | `65536` | Entry ceiling per shard — a backstop, not the mechanism |
 | `STORE_SWEEP_INTERVAL_MS` | `1000` | How often expired entries are reclaimed |
@@ -103,10 +125,30 @@ ClusterIP Service and let the Service spread the connections.
 switch. Left at the defaults — 5s dial, 3s read, three retries — an unreachable store makes
 each request hang about twenty seconds before failing. At 200ms it is under two.
 
+## Health
+
+Two endpoints on the peer port, answering different questions.
+
+| Path | Probe | Meaning |
+|---|---|---|
+| `/health` | liveness | The process exists. Deliberately trivial |
+| `/readiness` | readiness | The **protocol** listener answers a `PING`, and this replica is not draining |
+
+Readiness checks the port Traefik uses, not the port serving the probe: a replica whose
+protocol listener has stopped must leave the rotation even though its HTTP endpoint is
+healthy.
+
+They must not share an endpoint. A draining replica is emphatically alive, and a liveness
+probe that fails during a drain kills the pod it was meant to let finish.
+
+On `SIGTERM` the process fails readiness first, keeps serving for a drain period, then
+exits — so the orchestrator withdraws the replica before its listener closes.
+
 ## Cost
 
-Measured on a laptop with `cargo run --release --example latency`, against a store on
-loopback, driving the same wire traffic the proxy sends.
+Measured on a laptop. Reproduce with the examples below.
+
+**End to end, over TCP** (`cargo run --release --example latency`):
 
 | | 1 connection | 16 connections |
 |---|---|---|
@@ -116,16 +158,30 @@ loopback, driving the same wire traffic the proxy sends.
 | worst | 177us | 572us |
 | throughput | 24k/s | 68k/s |
 
-The single-connection column is what the store costs a request. The 16-connection column
-is dominated by queueing on a machine with far fewer cores than connections, not by the
-store — throughput rises while latency does, which is what saturation looks like.
+**The store's own operations** (`cargo run --release --example store_cost`):
 
-Both are far under the 200ms read timeout the proxy should be configured with — the p99
-has roughly six hundred times' headroom. That margin is the point of measuring, since the
-proxy has no fail-open switch: a store slow enough to hit the timeout produces a 500, not
-a slow request.
+| Operation | Cost |
+|---|---|
+| `apply_request`, one key | 36ns |
+| `apply_request`, distinct keys | 184ns |
+| `sweep_expired`, 200k entries | 730us |
+| capacity trim, worst case | 558us |
 
-The measurement reads whole replies rather than stopping at the first `read`. That is not
+The store contributes tens of nanoseconds to a request that costs tens of microseconds end
+to end — almost all of the measured latency is socket and scheduling, not this code. The
+16-connection column is queueing on a machine with far fewer cores than connections:
+throughput rises while latency does, which is what saturation looks like.
+
+The number that matters is the tail against the 200ms read timeout, where the p99 has
+roughly six hundred times' headroom. The proxy has no fail-open switch, so a store slow
+enough to hit that timeout produces a 500 rather than a slow request.
+
+The capacity trim is the only operation that can stall the request path, because it holds a
+shard's mutex. It selects a cut point rather than sorting; sorting cost 2ms, sixteen times
+the normal p99. It should never run at all — reaching it means distinct keys are arriving
+faster than they expire.
+
+The measurements read whole replies rather than stopping at the first `read`. That is not
 pedantry: an earlier version stopped early, so leftover bytes were attributed to the
 following request, and the distribution was wrong in both directions at once.
 
@@ -139,73 +195,103 @@ active in the last couple of seconds: proportional to concurrent traffic, not to
 Rate-limit keys are hashed on arrival, so a caller's raw source — which may be a
 credential — never exists at rest.
 
+Peer reports are capped at the busiest `PEER_MAX_KEYS_PER_REPORT` keys, because a report
+carries one entry per active key and a wide keyspace would otherwise mean megabytes to
+every peer several times a second. Truncating by consumption is what makes the cap safe: a
+key taken once contributes one token to a peer's decision, so dropping it risks one extra
+admission, while the keys where sharing decides anything are the ones kept.
+
+## Security
+
+The peer endpoint accepts a report from anyone the network allows unless
+`PEER_SHARED_SECRET` is set, in which case a matching `Authorization: Bearer` header is
+required and the comparison is constant-time. Running without one logs
+`PeerEndpointUnauthenticated` at startup.
+
+Unauthenticated is the default rather than an oversight. Inflated counts make a replica
+*more* restrictive, so the worst a stranger achieves is throttling traffic — bad, but not a
+bypass — and requiring a secret by default would leave the mesh silently broken for anyone
+who deployed without one. Set the secret, or confine the endpoint with a NetworkPolicy;
+preferably both.
+
+Request bodies are capped, the container runs as non-root on a read-only root filesystem
+with all capabilities dropped, and the image carries no shell.
+
 ## Tests
 
 ```sh
-cargo test          # unit tests
-cargo clippy --all-targets
+cargo test                        # units, differential conformance, mesh scenarios
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Three layers cover three different things.
+Five layers, each covering something the others cannot.
 
-**`cargo test` — arithmetic and behaviour.** The unit tests include a differential suite
-that executes the reference Lua in a test-only interpreter and diffs it against the native
-implementation over a generated corpus. The cucumber scenarios cover mesh accuracy across
-replicas. Neither needs any infrastructure.
+**Unit tests** — the arithmetic, the protocol framing, the store's expiry and capacity
+behaviour, the peer table, health. Includes a concurrency test driving one key from
+sixteen threads, because every other test is sequential and a sequential test cannot
+distinguish a correct lock from no lock at all.
 
-**`conformance/end-to-end.sh` — the whole chain.** Stands up real Traefik with a
-`rateLimit` middleware pointed at this store, plus a backend, and checks that a burst is
-admitted and the rest are refused. This is the only test that exercises Traefik's
-middleware, its Redis client, this store's protocol handling and the arithmetic together.
+**Differential conformance** — executes the reference Lua in a test-only interpreter and
+diffs it against the native implementation over a generated corpus. This is the only thing
+that proves the reimplementation is faithful. It runs the `PINNED_SCRIPT` constant, so a
+bad transcription into this repository fails the test rather than lurking behind a digest
+comparison that only ever compares it to itself.
 
-```
-admitted (200): 5
-refused  (429): 15
-PASSED: real Traefik enforced a shared limit through this store
-```
+**Mesh scenarios** (`tests/mesh_accuracy.feature`) — cucumber, covering what sharing
+achieves and what it costs between broadcasts. Two replicas sharing admit what one would;
+two replicas that never exchange admit twice as much.
 
-**`conformance/k3d/run.sh` — the production shape.** Stands up a throwaway k3d cluster and
-proves three store replicas enforce one shared limit behind real Traefik. This is the only
-test that covers the Kubernetes CRD provider, which builds the middleware from a `Middleware`
-resource rather than from a configuration file, and peer discovery through a headless
-Service rather than a hardcoded list. It applies the manifests in `deploy/` as written.
+**`conformance/end-to-end.sh`** — real Traefik with a `rateLimit` middleware pointed at
+this store, via the file provider. Exercises Traefik's middleware, its Redis client, this
+store's protocol handling and the arithmetic together.
 
+**`conformance/k3d/run.sh`** — a throwaway k3d cluster, three store replicas behind real
+Traefik reading a `Middleware` CRD. The only test covering the Kubernetes CRD provider,
+peer discovery through a headless Service, and the manifests in `deploy/` as written.
 Three replicas is what makes the result meaningful: without shared counters a burst of five
 would admit up to fifteen.
 
 ```
 Store replicas:   3
-Peer addresses:   10.42.1.3 10.42.2.2 10.42.0.3
+Peer addresses:   10.42.0.5 10.42.2.2 10.42.1.2
 admitted (200): 6
 refused  (429): 14
 PASSED: 3 replicas enforced one shared limit behind real Traefik
 ```
 
-The cluster is deleted afterwards and the kubectl context is never switched, so an existing
-session is left alone. Pass `--keepCluster true` to inspect it.
+The cluster is deleted afterwards and the kubectl context is never switched. Pass
+`--keepCluster true` to inspect it.
 
-**`conformance/probe.go.txt` — the client's own view.** Drives a running store with
-go-redis configured exactly as the rate limiter configures it. Copy it into a Traefik
-checkout as `conformance-probe/main.go`, start the store on `127.0.0.1:16379`, and `go run
-./conformance-probe`. Useful when a protocol question needs answering without standing up
-the whole chain.
+**`conformance/probe.go.txt`** — drives a running store with go-redis configured exactly as
+the rate limiter configures it. Useful for answering a protocol question without standing
+up the whole chain. Copy it into a Traefik checkout as `conformance-probe/main.go`.
 
-> A note for anyone on Docker Desktop: the end-to-end script keeps its generated
-> configuration inside the repository rather than in a temporary directory, because Docker
-> shares only a configured set of host paths and `/tmp` is usually not among them. A bind
-> mount from an unshared path silently produces an empty directory instead of the file, and
-> Traefik then serves 404 with nothing in its log to explain why. The script checks the
-> configuration actually reached the container and says so if it did not.
+> On Docker Desktop, the end-to-end script keeps its generated configuration inside the
+> repository rather than in a temporary directory. Docker shares only a configured set of
+> host paths and `/tmp` is usually not among them; a bind mount from an unshared path
+> silently produces an empty directory instead of the file, and Traefik then serves 404
+> with nothing in its log to explain why.
+
+## Deployment
+
+`deploy/traefik-ratelimit-store.yaml` — three replicas, two Services (a ClusterIP for the
+proxy, a headless one for peer discovery), a PodDisruptionBudget and topology spread.
+
+```sh
+docker build -t traefik-ratelimit-store:0.1.0 .
+kubectl apply -f deploy/traefik-ratelimit-store.yaml
+```
 
 ## Status
 
-Designed and being built; not deployed. `DESIGN.md` carries the full rationale, including
-the peer model and the conditions under which this should not be built at all.
+Built and tested; **not deployed**. `DESIGN.md` carries the full rationale, including the
+decision record and the conditions under which this should not be built at all.
 
-One upstream dependency is worth knowing about: Traefik has no `denyOnError` for its
-rate-limit middleware, so any store error becomes a 500. [PR #13529] adds it. Until that
-lands, adopting this — or any external store — means accepting fail-closed on the request
-path.
+Deployment is gated on one upstream change. Traefik has no `denyOnError` for its rate-limit
+middleware, so any store error becomes a 500 — [PR #13529] adds it. Until that lands,
+adopting this, or any external store, means accepting fail-closed on the request path.
 
+[#13704]: https://github.com/traefik/traefik/issues/13704
+[#13706]: https://github.com/traefik/traefik/issues/13706
 [PR #13529]: https://github.com/traefik/traefik/pull/13529

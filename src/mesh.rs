@@ -61,7 +61,10 @@ async fn publish_once(client: &reqwest::Client, store: &BucketStore, app_env: &A
         return 0;
     }
 
-    let report = PeerReport::new(app_env.replica_id.clone(), &store.collect_consumption());
+    let report = PeerReport::new(
+        app_env.replica_id.clone(),
+        &store.collect_consumption(app_env.peer_max_keys_per_report),
+    );
 
     // Spawned rather than awaited in turn, so one slow peer cannot delay the others.
     // Each task owns its inputs, and the client's timeout bounds how long it can linger.
@@ -70,8 +73,15 @@ async fn publish_once(client: &reqwest::Client, store: &BucketStore, app_env: &A
         let client = client.clone();
         let report = report.clone();
         let url = format!("http://{peer}{REPORT_PATH}");
+        let secret = app_env.peer_shared_secret.clone();
 
-        deliveries.spawn(async move { client.post(&url).json(&report).send().await.is_ok() });
+        deliveries.spawn(async move {
+            let mut request = client.post(&url).json(&report);
+            if !secret.is_empty() {
+                request = request.bearer_auth(secret);
+            }
+            request.send().await.is_ok()
+        });
     }
 
     let mut delivered = 0;
@@ -142,12 +152,59 @@ struct PeerEndpointState {
     peers: Arc<PeerTable>,
     replica_id: String,
     health: Arc<Health>,
+    /// Empty means unauthenticated, and the endpoint then relies entirely on network
+    /// policy to keep strangers out.
+    shared_secret: Arc<String>,
 }
 
-async fn receive_report(State(state): State<PeerEndpointState>, Json(report): Json<PeerReport>) {
+/// Compares two secrets without leaking their similarity through timing.
+///
+/// The exposure here is small — an attacker inside the cluster has better options — but a
+/// comparison that returns early is a habit worth not forming.
+fn secrets_match(presented: &str, expected: &str) -> bool {
+    if presented.len() != expected.len() {
+        return false;
+    }
+
+    presented
+        .bytes()
+        .zip(expected.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+/// Whether the caller may submit a report.
+///
+/// An unauthenticated endpoint accepts anything the network lets through. That is a
+/// deliberate default rather than an oversight: inflated counts make this replica *more*
+/// restrictive, so the worst a stranger achieves is throttling traffic — bad, but not a
+/// bypass — and requiring a secret by default would leave the mesh silently broken for
+/// anyone who deployed without one.
+fn is_authorised(headers: &axum::http::HeaderMap, shared_secret: &str) -> bool {
+    if shared_secret.is_empty() {
+        return true;
+    }
+
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|presented| secrets_match(presented, shared_secret))
+}
+
+async fn receive_report(
+    State(state): State<PeerEndpointState>,
+    headers: axum::http::HeaderMap,
+    Json(report): Json<PeerReport>,
+) -> StatusCode {
+    if !is_authorised(&headers, &state.shared_secret) {
+        return StatusCode::UNAUTHORIZED;
+    }
+
     state
         .peers
         .record(&state.replica_id, report, Instant::now());
+    StatusCode::ACCEPTED
 }
 
 /// Whether this replica should be restarted. Deliberately trivial: anything that can
@@ -185,16 +242,31 @@ pub async fn run_peer_endpoint(
     peers: Arc<PeerTable>,
     replica_id: String,
     health: Arc<Health>,
+    shared_secret: String,
     listen_address: &str,
 ) -> Result<(), TechnicalError> {
+    if shared_secret.is_empty() {
+        let (event_id, event_name) = log_events::PEER_ENDPOINT_UNAUTHENTICATED;
+        tracing::warn!(
+            event_id,
+            event_name,
+            "the peer endpoint accepts reports from anyone the network allows; \
+             set PEER_SHARED_SECRET, or confine it with a network policy"
+        );
+    }
+
     let app = Router::new()
         .route(REPORT_PATH, post(receive_report))
+        // A report is bounded by PEER_MAX_KEYS_PER_REPORT, so anything far larger is not
+        // a peer. Rejecting it early keeps a stranger from making this replica allocate.
+        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .route("/health", get(liveness))
         .route("/readiness", get(readiness))
         .with_state(PeerEndpointState {
             peers,
             replica_id,
             health,
+            shared_secret: Arc::new(shared_secret),
         });
 
     let listener = tokio::net::TcpListener::bind(listen_address)
@@ -213,6 +285,39 @@ pub async fn run_peer_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+    fn headers_with(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn an_unset_secret_accepts_anything() {
+        assert!(is_authorised(&HeaderMap::new(), ""));
+        assert!(is_authorised(&headers_with("Bearer whatever"), ""));
+    }
+
+    #[test]
+    fn a_set_secret_is_required_and_must_match() {
+        assert!(is_authorised(&headers_with("Bearer correct"), "correct"));
+        assert!(!is_authorised(&headers_with("Bearer wrong"), "correct"));
+        assert!(!is_authorised(&HeaderMap::new(), "correct"));
+    }
+
+    #[test]
+    fn a_secret_without_the_bearer_scheme_is_refused() {
+        assert!(!is_authorised(&headers_with("correct"), "correct"));
+        assert!(!is_authorised(&headers_with("Basic correct"), "correct"));
+    }
+
+    #[test]
+    fn secrets_of_different_lengths_never_match() {
+        assert!(!secrets_match("short", "much-longer-secret"));
+        assert!(!secrets_match("", "secret"));
+        assert!(secrets_match("same", "same"));
+    }
 
     #[test]
     fn an_empty_endpoint_yields_no_peers() {

@@ -84,7 +84,10 @@ impl World {
     /// One replica tells every other what it has consumed, exactly as the publisher does.
     fn broadcast_from(&self, index: usize, at: Instant) {
         let source = &self.replicas[index];
-        let report = PeerReport::new(source.id.clone(), &source.store.collect_consumption());
+        let report = PeerReport::new(
+            source.id.clone(),
+            &source.store.collect_consumption(usize::MAX),
+        );
 
         for (other, replica) in self.replicas.iter().enumerate() {
             if other != index {

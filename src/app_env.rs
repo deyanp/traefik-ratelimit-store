@@ -27,6 +27,11 @@ pub struct AppEnv {
     pub peer_staleness_limit: Duration,
     /// How long a single delivery may take before it is abandoned.
     pub peer_request_timeout: Duration,
+    /// Most keys a single report carries, busiest first.
+    pub peer_max_keys_per_report: usize,
+    /// Shared secret peers must present. Empty means the endpoint is unauthenticated and
+    /// relies entirely on network policy.
+    pub peer_shared_secret: String,
     pub store: StoreConfig,
 }
 
@@ -80,6 +85,8 @@ impl AppEnv {
             peer_publish_interval: read_duration_millis(env_vars, "PEER_PUBLISH_INTERVAL_MS", 150),
             peer_staleness_limit: read_duration_millis(env_vars, "PEER_STALENESS_LIMIT_MS", 1_000),
             peer_request_timeout: read_duration_millis(env_vars, "PEER_REQUEST_TIMEOUT_MS", 50),
+            peer_max_keys_per_report: read_usize(env_vars, "PEER_MAX_KEYS_PER_REPORT", 10_000),
+            peer_shared_secret: read_or_default(env_vars, "PEER_SHARED_SECRET", ""),
             store: StoreConfig {
                 shard_count: read_usize(env_vars, "STORE_SHARD_COUNT", 16),
                 capacity_per_shard: read_usize(env_vars, "STORE_CAPACITY_PER_SHARD", 65_536),
@@ -120,6 +127,20 @@ mod tests {
         let env = AppEnv::create(&env_vars);
 
         assert_eq!(env.replica_id, "store-7c9d-abcde");
+    }
+
+    #[test]
+    fn a_report_is_capped_by_default() {
+        let env = AppEnv::create(&HashMap::new());
+
+        assert_eq!(env.peer_max_keys_per_report, 10_000);
+    }
+
+    #[test]
+    fn the_peer_endpoint_is_unauthenticated_unless_a_secret_is_given() {
+        let env = AppEnv::create(&HashMap::new());
+
+        assert!(env.peer_shared_secret.is_empty());
     }
 
     #[test]

@@ -21,3 +21,6 @@ pub const PEER_PUBLISH_FAILED: (u32, &str) = (8005, "PeerPublishFailed");
 
 /// Peer discovery returned no addresses, so this replica is counting alone.
 pub const PEER_DISCOVERY_EMPTY: (u32, &str) = (8006, "PeerDiscoveryEmpty");
+
+/// The peer endpoint is running without a shared secret.
+pub const PEER_ENDPOINT_UNAUTHENTICATED: (u32, &str) = (8007, "PeerEndpointUnauthenticated");

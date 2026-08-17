@@ -126,18 +126,24 @@ impl Shard {
     /// Drops the least recently active tenth. This should never run: reaching it means
     /// distinct keys are arriving faster than they expire, which is a capacity or a
     /// traffic anomaly rather than normal operation.
+    ///
+    /// Selects the cut point rather than sorting. The shard's mutex is held throughout, so
+    /// every request hashing here waits for it — and at capacity a full sort costs about
+    /// two milliseconds, sixteen times the normal p99. Partitioning is linear and needs
+    /// only the boundary, since which particular entries go is not important.
     fn trim_least_recently_active(&mut self) {
-        let mut activity: Vec<(KeyHash, f64)> = self
+        let mut activity: Vec<f64> = self
             .entries
-            .iter()
-            .map(|(key, entry)| (*key, entry.state.last))
+            .values()
+            .map(|entry| entry.state.last)
             .collect();
-        activity.sort_by(|left, right| left.1.total_cmp(&right.1));
 
-        let drop_count = activity.len() / 10 + 1;
-        for (key, _) in activity.into_iter().take(drop_count) {
-            self.entries.remove(&key);
-        }
+        let drop_count = (activity.len() / 10 + 1).min(activity.len());
+        let (_, cut, _) =
+            activity.select_nth_unstable_by(drop_count - 1, |left, right| left.total_cmp(right));
+        let threshold = *cut;
+
+        self.entries.retain(|_, entry| entry.state.last > threshold);
     }
 }
 
@@ -239,9 +245,16 @@ impl BucketStore {
     /// What this replica has taken, per key, within the trailing window.
     ///
     /// Walks every shard once, which is the same walk the publish loop needs anyway.
-    pub fn collect_consumption(&self) -> HashMap<KeyHash, u32> {
+    ///
+    /// Truncated to the `limit` busiest keys. A report carries one entry per active key,
+    /// so a wide keyspace would otherwise produce a body of several megabytes to every
+    /// peer several times a second. Truncating by consumption rather than arbitrarily is
+    /// what makes the cap safe: a key this replica has taken one token for contributes one
+    /// token to a peer's decision, so dropping it risks one extra admission, while the
+    /// keys where sharing actually decides anything are the ones kept.
+    pub fn collect_consumption(&self, limit: usize) -> HashMap<KeyHash, u32> {
         let tick = self.tick.load(Ordering::Relaxed);
-        let mut consumption = HashMap::new();
+        let mut consumption: HashMap<KeyHash, u32> = HashMap::new();
 
         for shard in &self.shards {
             let mut shard = shard
@@ -255,6 +268,14 @@ impl BucketStore {
                     consumption.insert(*key, consumed);
                 }
             }
+        }
+
+        if consumption.len() > limit {
+            let mut counts: Vec<u32> = consumption.values().copied().collect();
+            let cut_index = consumption.len() - limit;
+            let (_, cut, _) = counts.select_nth_unstable(cut_index);
+            let threshold = *cut;
+            consumption.retain(|_, consumed| *consumed > threshold);
         }
 
         consumption
@@ -467,7 +488,7 @@ mod tests {
             store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
         }
 
-        assert_eq!(store.collect_consumption().get(&key), Some(&3));
+        assert_eq!(store.collect_consumption(usize::MAX).get(&key), Some(&3));
     }
 
     #[test]
@@ -482,7 +503,7 @@ mod tests {
             store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
         }
 
-        let consumed = *store.collect_consumption().get(&key).unwrap();
+        let consumed = *store.collect_consumption(usize::MAX).get(&key).unwrap();
         assert!(
             consumed < 40,
             "rejected requests must not be counted, got {consumed}"
@@ -501,14 +522,14 @@ mod tests {
             Duration::from_secs(60),
             start,
         );
-        assert_eq!(store.collect_consumption().get(&key), Some(&1));
+        assert_eq!(store.collect_consumption(usize::MAX).get(&key), Some(&1));
 
         // A full turn of the ring, which is what a peer's staleness window spans.
         for _ in 0..SLOT_COUNT {
             store.advance_tick();
         }
 
-        assert_eq!(store.collect_consumption().get(&key), None);
+        assert_eq!(store.collect_consumption(usize::MAX).get(&key), None);
     }
 
     #[test]
@@ -555,6 +576,105 @@ mod tests {
         // 800 requests at one instant against a burst of 10. Exactly the burst is
         // admitted; anything more means increments were lost between threads.
         assert_eq!(admitted.load(Ordering::Relaxed), BURST as usize);
+    }
+
+    #[test]
+    fn the_capacity_trim_keeps_the_most_recently_active() {
+        let start = Instant::now();
+        let config = StoreConfig {
+            shard_count: 1,
+            capacity_per_shard: 100,
+            sweep_interval: Duration::from_secs(1),
+        };
+        let store = BucketStore::new(config);
+
+        // Distinct activity timestamps, so oldest and newest are unambiguous.
+        for index in 0..100u32 {
+            store.apply_request(
+                KeyHash::from_key(format!("k{index}").as_bytes()),
+                &params_at(REALISTIC_NOW + f64::from(index)),
+                Duration::from_secs(600),
+                start,
+            );
+        }
+
+        // The insert that tips the shard over its capacity triggers the trim.
+        store.apply_request(
+            KeyHash::from_key(b"newest"),
+            &params_at(REALISTIC_NOW + 1000.0),
+            Duration::from_secs(600),
+            start,
+        );
+
+        // The oldest went; the newest stayed. Which particular entries were dropped is not
+        // important, only that recency decided it.
+        assert!(store.len() < 100, "the trim must have dropped something");
+        assert_eq!(
+            store
+                .apply_request(
+                    KeyHash::from_key(b"k0"),
+                    &params_at(REALISTIC_NOW + 1001.0),
+                    Duration::from_secs(600),
+                    start,
+                )
+                .state
+                .tokens,
+            BURST - 1.0,
+            "the least recently active entry should have been dropped"
+        );
+    }
+
+    #[test]
+    fn the_capacity_trim_leaves_room_to_insert() {
+        let start = Instant::now();
+        let config = StoreConfig {
+            shard_count: 1,
+            capacity_per_shard: 50,
+            sweep_interval: Duration::from_secs(1),
+        };
+        let store = BucketStore::new(config);
+
+        // Sustained overflow: far more distinct live keys than the shard can hold.
+        for index in 0..500u32 {
+            store.apply_request(
+                KeyHash::from_key(format!("k{index}").as_bytes()),
+                &params_at(REALISTIC_NOW + f64::from(index)),
+                Duration::from_secs(600),
+                start,
+            );
+        }
+
+        // Every insert still succeeded and the ceiling held throughout.
+        assert!(store.len() <= 50);
+        assert!(!store.is_empty(), "trimming must not empty the shard");
+    }
+
+    #[test]
+    fn a_report_is_truncated_to_the_busiest_keys() {
+        let start = Instant::now();
+        let store = BucketStore::new(StoreConfig::default());
+
+        // Ten keys, each taken a different number of times.
+        for index in 1..=10u32 {
+            let key = KeyHash::from_key(format!("k{index}").as_bytes());
+            for _ in 0..index {
+                store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
+            }
+        }
+
+        let full = store.collect_consumption(usize::MAX);
+        assert_eq!(full.len(), 10);
+
+        let capped = store.collect_consumption(3);
+        assert!(capped.len() <= 3, "got {} keys", capped.len());
+
+        // What survives is what matters: the keys this replica has taken most for, since
+        // those are the ones a peer's decision actually turns on.
+        let smallest_kept = capped.values().min().copied().unwrap_or(0);
+        assert!(
+            smallest_kept >= 8,
+            "the busiest keys should survive, kept a key with only {smallest_kept}"
+        );
     }
 
     #[test]

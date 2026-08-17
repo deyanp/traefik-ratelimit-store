@@ -90,9 +90,12 @@ async fn main() {
         let peers = peers.clone();
         let replica_id = app_env.replica_id.clone();
         let health = health.clone();
+        let secret = app_env.peer_shared_secret.clone();
         let address = app_env.peer_listen_address.clone();
         async move {
-            if let Err(error) = mesh::run_peer_endpoint(peers, replica_id, health, &address).await {
+            if let Err(error) =
+                mesh::run_peer_endpoint(peers, replica_id, health, secret, &address).await
+            {
                 tracing::error!(error = %error, "peer endpoint stopped");
             }
         }
