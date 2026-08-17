@@ -103,6 +103,26 @@ ClusterIP Service and let the Service spread the connections.
 switch. Left at the defaults — 5s dial, 3s read, three retries — an unreachable store makes
 each request hang about twenty seconds before failing. At 200ms it is under two.
 
+## Cost
+
+Measured on a laptop with `cargo run --release --example latency`, against a store on
+loopback, driving the same wire traffic the proxy sends.
+
+| | 1 connection | 16 connections |
+|---|---|---|
+| p50 | 33us | 218us |
+| p99 | 63us | 632us |
+| p99.9 | 99us | 2022us |
+| throughput | 26k/s | 67k/s |
+
+The single-connection column is what the store costs a request. The 16-connection column
+is dominated by queueing on a machine with far fewer cores than connections, not by the
+store — throughput rises while latency does, which is what saturation looks like.
+
+Both are far under the 200ms read timeout the proxy should be configured with: the tail
+would have to grow a hundredfold before a slow store became a 500 rather than a slow
+request. That headroom is the point of measuring, since the proxy has no fail-open switch.
+
 ## Memory
 
 Entries are reclaimed on a timer rather than when a map fills, and the sweep covers every

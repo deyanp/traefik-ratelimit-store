@@ -76,6 +76,12 @@ async fn main() {
     let health = Arc::new(Health::new(app_env.listen_address.clone()));
 
     spawn_sweeper(store.clone());
+    // Independent of the publisher, so the ring rotates even when this replica has no
+    // peers to publish to.
+    tokio::spawn(mesh::run_consumption_ticker(
+        store.clone(),
+        app_env.peer_publish_interval,
+    ));
     tokio::spawn(drain_on_termination(health.clone()));
 
     // The peer endpoint and the publisher are only useful together, and a replica with

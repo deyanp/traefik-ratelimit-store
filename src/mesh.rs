@@ -10,7 +10,7 @@
 
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -61,7 +61,6 @@ async fn publish_once(client: &reqwest::Client, store: &BucketStore, app_env: &A
         return 0;
     }
 
-    store.advance_tick();
     let report = PeerReport::new(app_env.replica_id.clone(), &store.collect_consumption());
 
     // Spawned rather than awaited in turn, so one slow peer cannot delay the others.
@@ -83,6 +82,20 @@ async fn publish_once(client: &reqwest::Client, store: &BucketStore, app_env: &A
     }
 
     delivered
+}
+
+/// Advances the consumption ring on a timer, forever, whether or not peers exist.
+///
+/// Rotation used to be a side effect of publishing, which meant a replica running alone
+/// never rotated: its per-key counters accumulated for the lifetime of each key. Nothing
+/// read them, so nothing broke — but an unbounded counter that is only correct because
+/// nobody looks at it is a defect waiting for its first reader.
+pub async fn run_consumption_ticker(store: Arc<BucketStore>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        store.advance_tick();
+    }
 }
 
 /// Runs the publish loop until the process ends.
