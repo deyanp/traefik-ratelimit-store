@@ -24,4 +24,7 @@ cucumber = "0.23"
 # bucket natively. Lua 5.1 specifically — the script uses `table.maxn`, removed in 5.2.
 mlua     = { version = "0.12", features = ["lua51", "vendored"] }
 
-# The cucumber World is declared here once tests/main.rs exists.
+# One World, inlined in tests/, so `name` resolves the runner without a path.
+[[test]]
+name    = "main"
+harness = false

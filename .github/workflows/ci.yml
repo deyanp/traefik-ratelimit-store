@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        # Warnings are failures here: every one so far has been a real defect or a
+        # readability problem, and letting them accumulate makes the next one invisible.
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        # Includes the differential conformance suite, which builds a Lua interpreter from
+        # source. That is a dev-dependency only; the shipped binary contains no interpreter.
+        run: cargo test --all-targets
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        # Not pushed. Proving the image builds is the point; publishing is a release
+        # concern and belongs to whatever promotes a tag.
+        run: docker build -t traefik-ratelimit-store:ci .
