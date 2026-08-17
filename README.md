@@ -121,11 +121,36 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
-`conformance/probe.go.txt` drives a running store with the real go-redis client, configured
-exactly as Traefik's rate limiter configures it. Copy it into a Traefik checkout as
-`conformance-probe/main.go`, start the store on `127.0.0.1:16379`, and `go run
-./conformance-probe`. It proves the handshake, the `NOSCRIPT`/`EVAL` exchange and the reply
-shape against the real client rather than against an assumption about it.
+Three layers cover three different things.
+
+**`cargo test` — arithmetic and behaviour.** The unit tests include a differential suite
+that executes the reference Lua in a test-only interpreter and diffs it against the native
+implementation over a generated corpus. The cucumber scenarios cover mesh accuracy across
+replicas. Neither needs any infrastructure.
+
+**`conformance/end-to-end.sh` — the whole chain.** Stands up real Traefik with a
+`rateLimit` middleware pointed at this store, plus a backend, and checks that a burst is
+admitted and the rest are refused. This is the only test that exercises Traefik's
+middleware, its Redis client, this store's protocol handling and the arithmetic together.
+
+```
+admitted (200): 5
+refused  (429): 15
+PASSED: real Traefik enforced a shared limit through this store
+```
+
+**`conformance/probe.go.txt` — the client's own view.** Drives a running store with
+go-redis configured exactly as the rate limiter configures it. Copy it into a Traefik
+checkout as `conformance-probe/main.go`, start the store on `127.0.0.1:16379`, and `go run
+./conformance-probe`. Useful when a protocol question needs answering without standing up
+the whole chain.
+
+> A note for anyone on Docker Desktop: the end-to-end script keeps its generated
+> configuration inside the repository rather than in a temporary directory, because Docker
+> shares only a configured set of host paths and `/tmp` is usually not among them. A bind
+> mount from an unshared path silently produces an empty directory instead of the file, and
+> Traefik then serves 404 with nothing in its log to explain why. The script checks the
+> configuration actually reached the container and says so if it did not.
 
 ## Status
 
