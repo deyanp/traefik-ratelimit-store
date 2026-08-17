@@ -44,6 +44,28 @@ fn evaluation(command: &str, script_or_digest: &str, key: &str, now: i64) -> Str
     out
 }
 
+/// The reply is an array of three bulk strings, which is seven CRLF-terminated pieces.
+const REPLY_TERMINATORS: usize = 7;
+
+/// Reads until a whole reply has arrived.
+///
+/// A single `read` can return a partial reply, and stopping there would measure time to
+/// first byte rather than time to an answer — understating exactly the number this exists
+/// to establish.
+async fn read_reply(stream: &mut TcpStream, buffer: &mut [u8]) {
+    let mut filled = 0;
+
+    loop {
+        let read = stream.read(&mut buffer[filled..]).await.expect("read");
+        assert!(read > 0, "the store closed the connection");
+        filled += read;
+
+        if buffer[..filled].windows(2).filter(|w| w == b"\r\n").count() >= REPLY_TERMINATORS {
+            return;
+        }
+    }
+}
+
 fn micros_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -66,7 +88,7 @@ async fn measure_connection(address: String, key: String, requests: usize) -> Ve
         .write_all(evaluation("EVAL", SCRIPT, &key, micros_now()).as_bytes())
         .await
         .expect("write");
-    stream.read(&mut buffer).await.expect("read");
+    read_reply(&mut stream, &mut buffer).await;
 
     let digest = traefik_ratelimit_store::script::compute_digest(SCRIPT);
     let mut latencies = Vec::with_capacity(requests);
@@ -76,7 +98,7 @@ async fn measure_connection(address: String, key: String, requests: usize) -> Ve
 
         let started = Instant::now();
         stream.write_all(command.as_bytes()).await.expect("write");
-        stream.read(&mut buffer).await.expect("read");
+        read_reply(&mut stream, &mut buffer).await;
         latencies.push(started.elapsed().as_micros() as u64);
     }
 
@@ -109,11 +131,7 @@ async fn main() {
         // Distinct keys, so this measures the store rather than lock contention on one
         // shard. Contention is measured separately, by the concurrency unit test.
         let key = format!("rate:bench:client-{index}");
-        handles.push(tokio::spawn(measure_connection(
-            address.clone(),
-            key,
-            each,
-        )));
+        handles.push(tokio::spawn(measure_connection(address.clone(), key, each)));
     }
 
     let mut latencies = Vec::with_capacity(connections * each);

@@ -110,18 +110,24 @@ loopback, driving the same wire traffic the proxy sends.
 
 | | 1 connection | 16 connections |
 |---|---|---|
-| p50 | 33us | 218us |
-| p99 | 63us | 632us |
-| p99.9 | 99us | 2022us |
-| throughput | 26k/s | 67k/s |
+| p50 | 34us | 226us |
+| p99 | 129us | 328us |
+| p99.9 | 157us | 398us |
+| worst | 177us | 572us |
+| throughput | 24k/s | 68k/s |
 
 The single-connection column is what the store costs a request. The 16-connection column
 is dominated by queueing on a machine with far fewer cores than connections, not by the
 store — throughput rises while latency does, which is what saturation looks like.
 
-Both are far under the 200ms read timeout the proxy should be configured with: the tail
-would have to grow a hundredfold before a slow store became a 500 rather than a slow
-request. That headroom is the point of measuring, since the proxy has no fail-open switch.
+Both are far under the 200ms read timeout the proxy should be configured with — the p99
+has roughly six hundred times' headroom. That margin is the point of measuring, since the
+proxy has no fail-open switch: a store slow enough to hit the timeout produces a 500, not
+a slow request.
+
+The measurement reads whole replies rather than stopping at the first `read`. That is not
+pedantry: an earlier version stopped early, so leftover bytes were attributed to the
+following request, and the distribution was wrong in both directions at once.
 
 ## Memory
 
