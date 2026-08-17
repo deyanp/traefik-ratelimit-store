@@ -81,7 +81,7 @@ fn loopback_form(address: &str) -> String {
         Some((host, port)) if host.is_empty() || host == "0.0.0.0" || host == "*" => {
             format!("127.0.0.1:{port}")
         }
-        Some((host, port)) if host == "[::]" => format!("[::1]:{port}"),
+        Some(("[::]", port)) => format!("[::1]:{port}"),
         _ => address.to_string(),
     }
 }
