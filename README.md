@@ -265,7 +265,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Five layers, each covering something the others cannot.
+Seven layers, each covering something the others cannot.
 
 **Unit tests** — the arithmetic, the protocol framing, the store's expiry and capacity
 behaviour, the peer table, health. Includes a concurrency test driving one key from
@@ -302,6 +302,34 @@ PASSED: 3 replicas enforced one shared limit behind real Traefik
 
 The cluster is deleted afterwards and the kubectl context is never switched. Pass
 `--keepCluster true` to inspect it.
+
+**`conformance/soak.sh`** — sustained load with connection churn, watching for leaks. Every
+other measurement holds its connections open, which is the shape that hides a leak in
+connection handling. Over 800,000 requests and 4,000 connections opened and closed, resident
+memory plateaued at 6.8MB by the tenth round and descriptors stayed flat at 15.
+
+```
+requests served:  800000
+connections made: 4000
+rss first/final:  6240KB / 6864KB
+fds final:        15
+PASSED: memory and descriptors plateaued under sustained churn
+```
+
+**`conformance/k3d/rolling_update.sh`** — replaces every store replica while traffic flows.
+The proxy answers any store error with a 500, so a rollout that drops connections shows up
+as 500s rather than as a blip. Needs a cluster from `run.sh --keepCluster true`.
+
+```
+ 590 429
+ 310 200
+served: 900   dropped: 0
+PASSED: every replica was replaced without dropping a request
+```
+
+That passes because of the drain: a replica fails readiness on SIGTERM, keeps serving for
+its drain period, then exits — so the orchestrator withdraws it before the listener closes
+and the proxy retries the resulting EOF onto a healthy replica.
 
 **`conformance/probe.go.txt`** — drives a running store with go-redis configured exactly as
 the rate limiter configures it. Useful for answering a protocol question without standing
