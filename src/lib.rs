@@ -7,6 +7,7 @@ pub mod errors;
 pub mod health;
 pub mod log_events;
 pub mod logging;
+pub mod memory_budget;
 pub mod mesh;
 pub mod peers;
 pub mod resp;

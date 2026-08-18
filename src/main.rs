@@ -7,7 +7,7 @@ use traefik_ratelimit_store::health::Health;
 use traefik_ratelimit_store::peers::PeerTable;
 use traefik_ratelimit_store::script::ScriptRegistry;
 use traefik_ratelimit_store::store::BucketStore;
-use traefik_ratelimit_store::{logging, mesh, server};
+use traefik_ratelimit_store::{log_events, logging, mesh, server};
 
 /// How long to keep serving after readiness starts failing.
 ///
@@ -69,6 +69,17 @@ async fn main() {
 
     let env_vars: HashMap<String, String> = std::env::vars().collect();
     let app_env = AppEnv::create(&env_vars);
+
+    let (event_id, event_name) = log_events::STORE_CAPACITY_DERIVED;
+    tracing::info!(
+        event_id,
+        event_name,
+        shards = app_env.store.shard_count,
+        entries_per_shard = app_env.store.capacity_per_shard,
+        total_entries = app_env.store.shard_count * app_env.store.capacity_per_shard,
+        approximate_bytes = app_env.store.shard_count * app_env.store.capacity_per_shard * 400,
+        "entry ceiling sized against the memory budget"
+    );
 
     let store = Arc::new(BucketStore::new(app_env.store));
     let peers = Arc::new(PeerTable::new(app_env.peer_staleness_limit));

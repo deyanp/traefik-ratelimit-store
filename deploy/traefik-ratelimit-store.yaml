@@ -121,6 +121,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # The entry ceiling is derived from this rather than set beside it, because
+            # the two are one decision: a ceiling above the limit means the process is
+            # killed before the trim that exists to prevent that ever runs. Left unset the
+            # store reads the cgroup limit itself; it is stated here so the relationship is
+            # visible where the limit is.
+            - name: STORE_MEMORY_BUDGET_MB
+              value: "128"
             - name: RUST_LOG
               value: "info"
           resources:

@@ -86,8 +86,9 @@ Everything has a working default; nothing is required.
 | `PEER_MAX_KEYS_PER_REPORT` | `10000` | Most keys a report carries, busiest first |
 | `PEER_SHARED_SECRET` | *(empty)* | Bearer token peers must present. Required once `PEER_ENDPOINT` is set |
 | `PEER_ALLOW_UNAUTHENTICATED` | `false` | Accept an unauthenticated peer endpoint deliberately |
+| `STORE_MEMORY_BUDGET_MB` | *(the cgroup limit)* | Budget the entry ceiling is derived from |
 | `STORE_SHARD_COUNT` | `16` | Independently locked shards |
-| `STORE_CAPACITY_PER_SHARD` | `8192` | Entry ceiling per shard — a backstop, not the mechanism. Size it against the memory limit |
+| `STORE_CAPACITY_PER_SHARD` | *(derived)* | Override the derived ceiling. Rarely needed |
 | `STORE_SWEEP_INTERVAL_MS` | `1000` | How often expired entries are reclaimed |
 | `REPLICA_ID` | `$HOSTNAME` | Identity used to discard this replica's own peer reports |
 
@@ -212,9 +213,11 @@ active in the last couple of seconds: proportional to concurrent traffic, not to
 Rate-limit keys are hashed on arrival, so a caller's raw source — which may be a
 credential — never exists at rest.
 
-**Cardinality is the thing to size against, and hashing does not reduce it.** Hashing the
-key gives a fixed 16 bytes and non-reversibility; one distinct source is still one entry,
-and the hex form in a report is *larger* than the address it replaces. Measured with
+**Cardinality is the thing to size against, and hashing does not reduce it.** Hashing gives
+a fixed 16 bytes and non-reversibility; one distinct source is still one entry. It does make
+each entry smaller: the key the proxy sends is `rate:<middleware>:<source>`, around 54 bytes
+for a realistic middleware name, so a 16-byte hash beats storing it raw — which would also
+cost a heap allocation and a pointer to chase on every lookup. Measured with
 `cargo run --release --example memory_per_key`:
 
 | active keys | store RSS | bytes/key | peer report |
@@ -224,11 +227,32 @@ and the hex form in a report is *larger* than the address it replaces. Measured 
 | 500,000 | 184MB | 373 | 18.5MB |
 | 1,000,000 | 383MB | 390 | 37MB |
 
-So `STORE_CAPACITY_PER_SHARD` and the container's memory limit are one decision, not two.
-At the shipped defaults the ceiling is 16 x 8192 = 131,072 entries, about 51MB, leaving
-room for connection buffers inside 128Mi. Raise either and raise the other: a ceiling above
-the memory limit means the process is killed before the trim that exists to prevent that
-ever runs.
+**So the ceiling is derived, not configured.** The entry count and the memory limit are one
+decision, and an earlier version of this store set them apart — a 128Mi limit beside a
+ceiling of a million entries, about 383MB, so the process would have been killed at roughly
+350k keys while its own backstop still reported headroom.
+
+There is now nothing to keep in step. The store reads the container's memory limit from
+cgroup — a kernel facility, so it works the same under Kubernetes, Docker and systemd — and
+sizes itself, giving entries half the budget and leaving the rest for connection buffers.
+`STORE_MEMORY_BUDGET_MB` overrides the discovered limit, `STORE_CAPACITY_PER_SHARD`
+overrides the result, and neither is normally needed.
+
+It says what it chose, at startup:
+
+```
+entry ceiling sized against the memory budget
+  shards=16 entries_per_shard=10485 total_entries=167760 approximate_bytes=67104000
+```
+
+| memory limit | entries held | of which |
+|---|---|---|
+| 128Mi | 167,760 | ~62MB |
+| 256Mi | 335,536 | ~125MB |
+| 512Mi | 671,088 | ~250MB |
+
+If your distinct-source count exceeds the middle column, raise the container limit; the
+ceiling follows on its own.
 
 Peer reports are capped at the busiest `PEER_MAX_KEYS_PER_REPORT` keys, because a report
 carries one entry per active key and a wide keyspace would otherwise mean megabytes to

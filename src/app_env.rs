@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::memory_budget;
 use crate::store::StoreConfig;
 
 /// Everything the binary needs to run, resolved at startup.
@@ -111,6 +112,23 @@ impl AppEnv {
             read_or_default(env_vars, "PEER_ALLOW_UNAUTHENTICATED", "false") == "true",
         );
 
+        // The entry ceiling is derived from the memory budget rather than configured
+        // beside it, because the two are one decision and setting them apart is how a
+        // store gets killed while its own ceiling still reports headroom.
+        let shard_count = read_usize(env_vars, "STORE_SHARD_COUNT", 16);
+        let budget_bytes = memory_budget::resolve_budget_bytes(
+            read_optional(env_vars, "STORE_MEMORY_BUDGET_MB").and_then(|v| v.parse().ok()),
+        );
+        let capacity_per_shard = read_optional(env_vars, "STORE_CAPACITY_PER_SHARD")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| memory_budget::entries_per_shard(budget_bytes, shard_count));
+
+        let store_config = StoreConfig {
+            shard_count,
+            capacity_per_shard,
+            sweep_interval: read_duration_millis(env_vars, "STORE_SWEEP_INTERVAL_MS", 1_000),
+        };
+
         Self {
             app_name: read_or_default(env_vars, "APPNAME", "traefik-ratelimit-store"),
             replica_id,
@@ -122,11 +140,7 @@ impl AppEnv {
             peer_request_timeout: read_duration_millis(env_vars, "PEER_REQUEST_TIMEOUT_MS", 50),
             peer_max_keys_per_report: read_usize(env_vars, "PEER_MAX_KEYS_PER_REPORT", 10_000),
             peer_shared_secret,
-            store: StoreConfig {
-                shard_count: read_usize(env_vars, "STORE_SHARD_COUNT", 16),
-                capacity_per_shard: read_usize(env_vars, "STORE_CAPACITY_PER_SHARD", 65_536),
-                sweep_interval: read_duration_millis(env_vars, "STORE_SWEEP_INTERVAL_MS", 1_000),
-            },
+            store: store_config,
         }
     }
 }
@@ -143,6 +157,8 @@ mod tests {
         assert_eq!(env.peer_publish_interval, Duration::from_millis(150));
         assert_eq!(env.store.shard_count, 16);
         assert!(env.peer_endpoint.is_empty());
+        // Derived rather than a fixed default.
+        assert!(env.store.capacity_per_shard >= 1_024);
     }
 
     #[test]
@@ -162,6 +178,31 @@ mod tests {
         let env = AppEnv::create(&env_vars);
 
         assert_eq!(env.replica_id, "store-7c9d-abcde");
+    }
+
+    #[test]
+    fn the_entry_ceiling_is_derived_from_the_budget() {
+        let env_vars = HashMap::from([("STORE_MEMORY_BUDGET_MB".to_string(), "128".to_string())]);
+
+        let env = AppEnv::create(&env_vars);
+
+        // Whatever it derives must fit inside the budget it derived from — the property
+        // that was violated when the two were configured separately.
+        let worst_case = env.store.capacity_per_shard * env.store.shard_count * 400;
+        assert!(worst_case < 128 * 1024 * 1024, "{worst_case} bytes");
+        assert!(env.store.capacity_per_shard > 1_000);
+    }
+
+    #[test]
+    fn an_explicit_ceiling_still_wins() {
+        let env_vars = HashMap::from([
+            ("STORE_MEMORY_BUDGET_MB".to_string(), "128".to_string()),
+            ("STORE_CAPACITY_PER_SHARD".to_string(), "500".to_string()),
+        ]);
+
+        let env = AppEnv::create(&env_vars);
+
+        assert_eq!(env.store.capacity_per_shard, 500);
     }
 
     #[test]
