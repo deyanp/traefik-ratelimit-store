@@ -105,6 +105,17 @@ spec:
               value: "150"
             - name: PEER_STALENESS_LIMIT_MS
               value: "1000"
+            # Without this the replicas refuse to start, deliberately. An unauthenticated
+            # peer endpoint lets anyone erase a peer's consumption and lift the limit, so
+            # the choice has to be made rather than defaulted into.
+            #
+            #   kubectl create secret generic traefik-ratelimit-store \
+            #       --from-literal=peer-shared-secret="$(openssl rand -hex 32)"
+            - name: PEER_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: traefik-ratelimit-store
+                  key: peer-shared-secret
             # Identity, used to discard a replica's own echo. No downward API needed.
             - name: REPLICA_ID
               valueFrom:

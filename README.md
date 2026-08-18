@@ -84,7 +84,8 @@ Everything has a working default; nothing is required.
 | `PEER_STALENESS_LIMIT_MS` | `1000` | How long a peer's report stays usable |
 | `PEER_REQUEST_TIMEOUT_MS` | `50` | How long a single delivery may take before it is abandoned |
 | `PEER_MAX_KEYS_PER_REPORT` | `10000` | Most keys a report carries, busiest first |
-| `PEER_SHARED_SECRET` | *(empty)* | Bearer token peers must present. Empty means unauthenticated |
+| `PEER_SHARED_SECRET` | *(empty)* | Bearer token peers must present. Required once `PEER_ENDPOINT` is set |
+| `PEER_ALLOW_UNAUTHENTICATED` | `false` | Accept an unauthenticated peer endpoint deliberately |
 | `STORE_SHARD_COUNT` | `16` | Independently locked shards |
 | `STORE_CAPACITY_PER_SHARD` | `65536` | Entry ceiling per shard — a backstop, not the mechanism |
 | `STORE_SWEEP_INTERVAL_MS` | `1000` | How often expired entries are reclaimed |
@@ -208,11 +209,34 @@ The peer endpoint accepts a report from anyone the network allows unless
 required and the comparison is constant-time. Running without one logs
 `PeerEndpointUnauthenticated` at startup.
 
-Unauthenticated is the default rather than an oversight. Inflated counts make a replica
-*more* restrictive, so the worst a stranger achieves is throttling traffic — bad, but not a
-bypass — and requiring a secret by default would leave the mesh silently broken for anyone
-who deployed without one. Set the secret, or confine the endpoint with a NetworkPolicy;
-preferably both.
+**Set it.** An unauthenticated endpoint is a rate-limit bypass, not merely a nuisance.
+Reports are keyed by replica id and overwrite, so a stranger who reaches the endpoint and
+knows a replica's id — a pod name — can send an empty report in its name and erase that
+replica's consumption from every peer's view. Repeat for each replica and every one of them
+believes it is alone, which is N times the configured limit: exactly the failure this store
+exists to prevent.
+
+Demonstrated: a peer honestly reporting ten tokens taken produces a 333ms delay for the
+next request; a forged empty report in that peer's name drops it to zero.
+
+A NetworkPolicy is the other half, not a substitute — k3s and k3d ship flannel, which does
+not enforce NetworkPolicy at all, and on managed clusters it holds only where the CNI
+enforces it.
+
+Neither default is safe, so there is no default. A replica with `PEER_ENDPOINT` set and no
+`PEER_SHARED_SECRET` **refuses to start**, naming both ways out. Requiring a secret that
+has not been configured would be no better than omitting one: every report would be
+rejected, every peer would age out, and the same N-times-looser limit would arrive by a
+different route. The only safe thing is to make the operator choose, so
+`PEER_ALLOW_UNAUTHENTICATED=true` records the decision in configuration rather than letting
+it happen by omission.
+
+The shipped manifest reads the secret from a Kubernetes Secret:
+
+```sh
+kubectl create secret generic traefik-ratelimit-store \
+    --from-literal=peer-shared-secret="$(openssl rand -hex 32)"
+```
 
 Request bodies are capped, the container runs as non-root on a read-only root filesystem
 with all capabilities dropped, and the image carries no shell.

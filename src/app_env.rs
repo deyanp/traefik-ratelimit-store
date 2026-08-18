@@ -68,6 +68,33 @@ fn read_usize(env_vars: &HashMap<String, String>, name: &str, fallback: usize) -
         .unwrap_or(fallback)
 }
 
+/// Refuses to start a meshed replica whose peer endpoint anyone can write to.
+///
+/// An unauthenticated endpoint is a rate-limit bypass rather than a nuisance: reports are
+/// keyed by replica id and overwrite, so a stranger can send an empty report in a peer's
+/// name and erase that peer's consumption from this replica's view. Do that to each
+/// replica and every one believes it is alone.
+///
+/// Requiring a secret by default would be no safer — an unset secret would reject every
+/// report, age every peer out, and reach the same over-admission by a different route. So
+/// neither default is safe, and the only safe thing is to make the operator choose.
+fn require_a_decision_about_peer_authentication(
+    peer_endpoint: &str,
+    peer_shared_secret: &str,
+    allow_unauthenticated: bool,
+) {
+    if peer_endpoint.trim().is_empty() || !peer_shared_secret.is_empty() || allow_unauthenticated {
+        return;
+    }
+
+    panic!(
+        "PEER_ENDPOINT is set but PEER_SHARED_SECRET is not. An unauthenticated peer \
+         endpoint lets anyone erase a peer's consumption and lift the rate limit. Set \
+         PEER_SHARED_SECRET to the same value on every replica, or set \
+         PEER_ALLOW_UNAUTHENTICATED=true to accept that risk deliberately."
+    );
+}
+
 impl AppEnv {
     pub fn create(env_vars: &HashMap<String, String>) -> Self {
         // The hostname is stable for a pod's lifetime and unique within a deployment,
@@ -76,17 +103,25 @@ impl AppEnv {
             .or_else(|| read_optional(env_vars, "HOSTNAME"))
             .unwrap_or_else(|| "replica".to_string());
 
+        let peer_endpoint = read_or_default(env_vars, "PEER_ENDPOINT", "");
+        let peer_shared_secret = read_or_default(env_vars, "PEER_SHARED_SECRET", "");
+        require_a_decision_about_peer_authentication(
+            &peer_endpoint,
+            &peer_shared_secret,
+            read_or_default(env_vars, "PEER_ALLOW_UNAUTHENTICATED", "false") == "true",
+        );
+
         Self {
             app_name: read_or_default(env_vars, "APPNAME", "traefik-ratelimit-store"),
             replica_id,
             listen_address: read_or_default(env_vars, "LISTEN_ADDRESS", "0.0.0.0:6379"),
             peer_listen_address: read_or_default(env_vars, "PEER_LISTEN_ADDRESS", "0.0.0.0:8080"),
-            peer_endpoint: read_or_default(env_vars, "PEER_ENDPOINT", ""),
+            peer_endpoint,
             peer_publish_interval: read_duration_millis(env_vars, "PEER_PUBLISH_INTERVAL_MS", 150),
             peer_staleness_limit: read_duration_millis(env_vars, "PEER_STALENESS_LIMIT_MS", 1_000),
             peer_request_timeout: read_duration_millis(env_vars, "PEER_REQUEST_TIMEOUT_MS", 50),
             peer_max_keys_per_report: read_usize(env_vars, "PEER_MAX_KEYS_PER_REPORT", 10_000),
-            peer_shared_secret: read_or_default(env_vars, "PEER_SHARED_SECRET", ""),
+            peer_shared_secret,
             store: StoreConfig {
                 shard_count: read_usize(env_vars, "STORE_SHARD_COUNT", 16),
                 capacity_per_shard: read_usize(env_vars, "STORE_CAPACITY_PER_SHARD", 65_536),
@@ -144,9 +179,52 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_replica_needs_no_secret() {
+        // No mesh, no endpoint to protect.
+        let env = AppEnv::create(&HashMap::new());
+
+        assert!(env.peer_endpoint.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "PEER_SHARED_SECRET")]
+    fn a_meshed_replica_refuses_to_start_without_a_decision() {
+        let env_vars = HashMap::from([("PEER_ENDPOINT".to_string(), "peers.svc:8080".to_string())]);
+
+        AppEnv::create(&env_vars);
+    }
+
+    #[test]
+    fn a_meshed_replica_starts_with_a_secret() {
+        let env_vars = HashMap::from([
+            ("PEER_ENDPOINT".to_string(), "peers.svc:8080".to_string()),
+            ("PEER_SHARED_SECRET".to_string(), "shared".to_string()),
+        ]);
+
+        let env = AppEnv::create(&env_vars);
+
+        assert_eq!(env.peer_shared_secret, "shared");
+    }
+
+    #[test]
+    fn the_risk_can_be_accepted_deliberately() {
+        // The escape hatch exists so local development does not need a secret, and so the
+        // choice is recorded in configuration rather than made by omission.
+        let env_vars = HashMap::from([
+            ("PEER_ENDPOINT".to_string(), "peers.svc:8080".to_string()),
+            ("PEER_ALLOW_UNAUTHENTICATED".to_string(), "true".to_string()),
+        ]);
+
+        let env = AppEnv::create(&env_vars);
+
+        assert!(env.peer_shared_secret.is_empty());
+    }
+
+    #[test]
     fn explicit_values_are_taken() {
         let env_vars = HashMap::from([
             ("PEER_ENDPOINT".to_string(), "peers.svc:8080".to_string()),
+            ("PEER_SHARED_SECRET".to_string(), "shared".to_string()),
             ("PEER_PUBLISH_INTERVAL_MS".to_string(), "250".to_string()),
             ("STORE_SHARD_COUNT".to_string(), "32".to_string()),
         ]);

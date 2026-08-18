@@ -67,6 +67,11 @@ kubectl --context "$CONTEXT" apply --server-side \
     -f "https://raw.githubusercontent.com/traefik/traefik/$traefikVersion/integration/fixtures/k8s/01-traefik-crd.yml" > /dev/null
 
 echo "Deploying the store from deploy/..."
+# The manifest requires a peer secret, so the cluster gets one. Generated per run rather
+# than hardcoded, so the test exercises the same path production does.
+kubectl --context "$CONTEXT" create secret generic traefik-ratelimit-store \
+    --from-literal=peer-shared-secret="$(openssl rand -hex 32)" > /dev/null
+
 sed "s|image: traefik-ratelimit-store:.*|image: $IMAGE|" "$ROOT/deploy/traefik-ratelimit-store.yaml" \
     | kubectl --context "$CONTEXT" apply -f - > /dev/null
 
