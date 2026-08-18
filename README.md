@@ -151,13 +151,27 @@ Measured on a laptop. Reproduce with the examples below.
 
 **End to end, over TCP** (`cargo run --release --example latency`):
 
-| | 1 connection | 16 connections |
-|---|---|---|
-| p50 | 34us | 226us |
-| p99 | 129us | 328us |
-| p99.9 | 157us | 398us |
-| worst | 177us | 572us |
-| throughput | 24k/s | 68k/s |
+| concurrency | throughput | p50 | p99 |
+|---|---|---|---|
+| 1 | 24k/s | 34us | 129us |
+| 16 | 68k/s | 226us | 328us |
+| 100 | 52k/s | 1.6ms | 2.6ms |
+| 500 | 50k/s | 6.4ms | 16.7ms |
+| 1500 | 47k/s | 26.3ms | 37.6ms |
+
+Read that as a saturation curve, not a cost curve. Throughput plateaus around 50k/s from a
+hundred connections on, after which latency is queue wait rather than service time —
+Little's Law predicts 1500/47000 = 32ms against 26ms measured. The client shares the
+machine with the store here, so the plateau is the *pair* saturating, not the store alone.
+
+Concurrency in that table means requests in flight, not connections open. A pool of
+idle connections costs memory and nothing else; only concurrent requests queue. With
+`maxActiveConns: 5` the proxy bounds its own in-flight requests per middleware instance,
+which keeps the left of this table the operative part — and is also what makes pool
+exhaustion, rather than store latency, the thing to watch.
+
+At 1500 concurrent connections the store held peak RSS of **29.8MB** against the manifest's
+128Mi limit, about 18KB per connection, and completed all 75,000 requests without error.
 
 **The store's own operations** (`cargo run --release --example store_cost`):
 
@@ -173,9 +187,11 @@ to end — almost all of the measured latency is socket and scheduling, not this
 16-connection column is queueing on a machine with far fewer cores than connections:
 throughput rises while latency does, which is what saturation looks like.
 
-The number that matters is the tail against the 200ms read timeout, where the p99 has
-roughly six hundred times' headroom. The proxy has no fail-open switch, so a store slow
-enough to hit that timeout produces a 500 rather than a slow request.
+The number that matters is the tail against the 200ms read timeout. At low concurrency the
+p99 has several hundred times' headroom; at 1500 concurrent requests it is closer to five
+times. The proxy has no fail-open switch, so a store slow enough to hit that timeout
+produces a 500 rather than a slow request — which is why the headroom, not the median,
+is the figure to track.
 
 The capacity trim is the only operation that can stall the request path, because it holds a
 shard's mutex. It selects a cut point rather than sorting; sorting cost 2ms, sixteen times
