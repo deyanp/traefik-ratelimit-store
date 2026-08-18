@@ -87,7 +87,7 @@ Everything has a working default; nothing is required.
 | `PEER_SHARED_SECRET` | *(empty)* | Bearer token peers must present. Required once `PEER_ENDPOINT` is set |
 | `PEER_ALLOW_UNAUTHENTICATED` | `false` | Accept an unauthenticated peer endpoint deliberately |
 | `STORE_SHARD_COUNT` | `16` | Independently locked shards |
-| `STORE_CAPACITY_PER_SHARD` | `65536` | Entry ceiling per shard — a backstop, not the mechanism |
+| `STORE_CAPACITY_PER_SHARD` | `8192` | Entry ceiling per shard — a backstop, not the mechanism. Size it against the memory limit |
 | `STORE_SWEEP_INTERVAL_MS` | `1000` | How often expired entries are reclaimed |
 | `REPLICA_ID` | `$HOSTNAME` | Identity used to discard this replica's own peer reports |
 
@@ -211,6 +211,24 @@ active in the last couple of seconds: proportional to concurrent traffic, not to
 
 Rate-limit keys are hashed on arrival, so a caller's raw source — which may be a
 credential — never exists at rest.
+
+**Cardinality is the thing to size against, and hashing does not reduce it.** Hashing the
+key gives a fixed 16 bytes and non-reversibility; one distinct source is still one entry,
+and the hex form in a report is *larger* than the address it replaces. Measured with
+`cargo run --release --example memory_per_key`:
+
+| active keys | store RSS | bytes/key | peer report |
+|---|---|---|---|
+| 100,000 | 17.5MB | 161 | 3.7MB |
+| 250,000 | 84MB | 337 | 9.2MB |
+| 500,000 | 184MB | 373 | 18.5MB |
+| 1,000,000 | 383MB | 390 | 37MB |
+
+So `STORE_CAPACITY_PER_SHARD` and the container's memory limit are one decision, not two.
+At the shipped defaults the ceiling is 16 x 8192 = 131,072 entries, about 51MB, leaving
+room for connection buffers inside 128Mi. Raise either and raise the other: a ceiling above
+the memory limit means the process is killed before the trim that exists to prevent that
+ever runs.
 
 Peer reports are capped at the busiest `PEER_MAX_KEYS_PER_REPORT` keys, because a report
 carries one entry per active key and a wide keyspace would otherwise mean megabytes to

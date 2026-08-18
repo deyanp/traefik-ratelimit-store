@@ -56,6 +56,13 @@ pub struct StoreConfig {
     /// Number of independently locked shards.
     pub shard_count: usize,
     /// Hard entry ceiling per shard. A backstop, not the mechanism.
+    ///
+    /// Must be sized against the container's memory limit, and the two are easy to set
+    /// independently and get wrong: an entry costs around 390 bytes once the map has
+    /// grown, so a ceiling above the limit means the process is killed before the trim
+    /// that exists to prevent that ever runs. `shard_count * capacity_per_shard * 400`
+    /// bytes is the figure to compare, and connection buffers (~18KB each) come out of
+    /// the same budget.
     pub capacity_per_shard: usize,
     /// How often the background sweeper reclaims expired entries.
     pub sweep_interval: Duration,
@@ -65,7 +72,11 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             shard_count: 16,
-            capacity_per_shard: 65_536,
+            // 16 x 8192 entries at ~390 bytes is about 51MB, which leaves room for
+            // connection buffers inside the 128Mi the shipped manifest allows. Raising
+            // one of these without the other is how a store gets OOM-killed while its
+            // capacity backstop reports plenty of headroom.
+            capacity_per_shard: 8_192,
             sweep_interval: Duration::from_secs(1),
         }
     }
