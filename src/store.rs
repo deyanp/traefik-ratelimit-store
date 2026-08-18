@@ -240,6 +240,20 @@ impl BucketStore {
             shard.sweep_expired(now);
             if shard.entries.len() >= self.config.capacity_per_shard {
                 shard.trim_least_recently_active();
+
+                // The one condition an operator cannot infer from anything else. Distinct
+                // keys are arriving faster than they expire, so the store is shedding the
+                // least recently active — which means some sources are being admitted
+                // against a fresh bucket. It is naturally throttled: a trim frees a tenth
+                // of a shard, so this cannot fire again until that tenth is refilled.
+                let (event_id, event_name) = crate::log_events::STORE_AT_CAPACITY;
+                tracing::warn!(
+                    event_id,
+                    event_name,
+                    ceiling = self.config.capacity_per_shard,
+                    remaining = shard.entries.len(),
+                    "shard at capacity; shedding least recently active keys"
+                );
             }
         }
 
@@ -685,6 +699,47 @@ mod tests {
         assert!(
             smallest_kept >= 8,
             "the busiest keys should survive, kept a key with only {smallest_kept}"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_new_keys_evicts_the_quiet_and_keeps_the_busy() {
+        // What happens when the ceiling is reached and distinct keys keep arriving. The
+        // ceiling bounds memory, so something has to go; the question is what.
+        let start = Instant::now();
+        let config = StoreConfig {
+            shard_count: 1,
+            capacity_per_shard: 200,
+            sweep_interval: Duration::from_secs(1),
+        };
+        let store = BucketStore::new(config);
+        let busy = KeyHash::from_key(b"rate:mw:busy");
+
+        // A steady client, interleaved with a flood of keys seen once each.
+        for index in 0..5_000u32 {
+            let now = REALISTIC_NOW + f64::from(index) * 1_000.0;
+            store.apply_request(busy, &params_at(now), TTL, start);
+            store.apply_request(
+                KeyHash::from_key(format!("rate:mw:flood-{index}").as_bytes()),
+                &params_at(now),
+                TTL,
+                start,
+            );
+        }
+
+        // Memory stayed bounded through 5,000 distinct arrivals.
+        assert!(store.len() <= 200, "held {} entries", store.len());
+
+        // And the steady client kept its bucket. Eviction is by least-recent activity, so
+        // the flood evicts itself: a source seen once is the least recently active thing
+        // in the shard, while a source still sending is the last thing to go. The client
+        // worth limiting stays limited; the ones dropped were nowhere near their limit.
+        let outcome =
+            store.apply_request(busy, &params_at(REALISTIC_NOW + 5_000_000.0), TTL, start);
+        assert!(
+            outcome.state.tokens < BURST - 1.0,
+            "the busy key was evicted and got a fresh bucket: {}",
+            outcome.state.tokens
         );
     }
 

@@ -8,7 +8,9 @@ Verified against **traefik/traefik v3.7.1** (and `v3.7` at `f762508`, `master` a
 `b51bd71`) and **redis/go-redis v9.7.0**. Every code reference below was read, not
 assumed.
 
-**Status: designed, not approved to build.** See [When not to build this](#when-not-to-build-this).
+**Status: built, tested, not deployed.** Deployment is gated on one upstream change
+(§12). What the design got wrong is recorded in §15 rather than quietly corrected — the
+mistakes are the part worth reading.
 
 ---
 
@@ -45,7 +47,11 @@ gets N×. No divisor is correct for both.
 | 8 | Single endpoint in Traefik config (never a list) | Settled |
 | 9 | Timeouts pinned at 200 ms; pools pinned small | Settled |
 | 10 | Repo `deyanp/traefik-ratelimit-store` | Settled |
-| 11 | Whether to build at all | Blocked on §12 |
+| 11 | Whether to build at all | Built |
+| 12 | Readiness answers for the protocol port; liveness is separate | Settled (§8.1) |
+| 13 | Drain on SIGTERM before the listener closes | Settled (§8.1) |
+| 14 | Peer endpoint authenticated, and refuses to start undecided | Settled (§9.1) |
+| 15 | Entry ceiling derived from the memory budget, not configured | Settled (§6.5) |
 
 ---
 
@@ -227,6 +233,43 @@ TTL.
 Traefik sends the key already formed. Hashing it before storing means the raw source
 never exists at rest — which matters if the source criterion is ever a bearer token
 again, and costs nothing.
+
+---
+
+### 6.5 The ceiling is derived, not configured
+
+The entry ceiling and the container's memory limit are one decision. An earlier version of
+this design set them apart — a 128Mi limit beside a ceiling of a million entries — and an
+entry costs about 390 bytes once the map has grown, so the process would have been killed
+at roughly 350k keys while its own backstop still reported headroom. A backstop above the
+limit it protects is decoration.
+
+So the store reads the container's limit from cgroup (a kernel facility, so it behaves the
+same under Kubernetes, Docker and systemd), gives entries half of it, and derives the
+per-shard ceiling. It logs what it chose. `STORE_MEMORY_BUDGET_MB` overrides the discovered
+limit; `STORE_CAPACITY_PER_SHARD` overrides the result; neither is normally needed.
+
+| memory limit | entries held |
+|---|---|
+| 128Mi | 167,760 |
+| 256Mi | 335,536 |
+| 512Mi | 671,088 |
+
+### 6.6 What happens at the ceiling
+
+Distinct keys keep arriving; the ceiling holds; something has to go. The insert that finds
+a shard full sweeps expired entries first, and if that frees nothing, drops the least
+recently active tenth.
+
+**The flood evicts itself.** A source seen once is the least recently active thing in the
+shard, while a source still sending is the last thing to go. So the client worth limiting
+stays limited, and the entries dropped belong to sources that were nowhere near their limit
+— they are re-admitted against a fresh bucket, which changes nothing for them.
+
+The cost is amortized: a trim frees a tenth of a shard, so the O(n) work cannot recur until
+that tenth is refilled. It emits `StoreAtCapacity`, which is the one condition an operator
+cannot infer from anything else — memory looks fine, latency looks fine, and quietly some
+sources are being admitted against fresh buckets. Alarm on it.
 
 ---
 
@@ -433,6 +476,29 @@ so terminations close connections rather than stall them.
 
 ---
 
+### 8.1 Health, and draining
+
+Two probes, answering different questions, and they must not share an endpoint. Liveness
+asks whether to restart the process; readiness asks whether to send it traffic. A draining
+replica is emphatically alive, and a liveness probe that fails during a drain kills the pod
+it was meant to let finish.
+
+`/readiness` answers **for the protocol port**, by connecting to it and expecting a `PONG`.
+A probe that only proves it can answer its own probe proves nothing: a replica whose RESP
+listener has stopped while its HTTP endpoint still answers must leave the rotation.
+
+It deliberately does not touch the store. A probe that acquires production locks can cause
+the stall it is looking for, and a store wedged badly enough to matter fails this check
+anyway by never completing it.
+
+On `SIGTERM` the process fails readiness first, keeps serving for a drain period, then
+exits — so the orchestrator withdraws the replica before its listener closes. Without that
+ordering the grace period buys nothing: connections keep arriving until the socket
+disappears underneath them. Verified by replacing every replica under load without dropping
+a request (§11.5).
+
+---
+
 ## 9. Failure semantics
 
 **Traefik fails closed and there is no override.** Any error reaching Traefik returns
@@ -476,11 +542,44 @@ only the routes that genuinely need cross-node budgets on the shim.
 
 ---
 
+### 9.1 The peer endpoint is a bypass if left open
+
+This was documented backwards at first, and the correction matters. Reports are keyed by
+replica id and **overwrite**, so a stranger who reaches the endpoint and knows a replica's
+id — a pod name — can send an empty report in its name and erase that replica's consumption
+from every peer's view. Do that to each replica and every one believes it is alone: N times
+the configured limit, which is the exact failure this store exists to prevent.
+
+Demonstrated against a running store: a peer honestly reporting ten tokens taken produces a
+333ms delay for the next request; a forged empty report in that peer's name drops it to
+zero.
+
+A NetworkPolicy is the other half rather than a substitute — k3s and k3d ship flannel, which
+does not enforce NetworkPolicy at all.
+
+**Neither default is safe, so there is no default.** Requiring a secret that has not been
+configured would reject every report, age every peer out, and reach the same over-admission
+by another route. A replica with `PEER_ENDPOINT` set and no `PEER_SHARED_SECRET` therefore
+refuses to start, naming both ways out; `PEER_ALLOW_UNAUTHENTICATED=true` records the
+decision in configuration rather than letting it happen by omission.
+
+---
+
 ## 10. Observability
 
 A dedicated store makes per-key rate-limit metrics possible for the first time — which
 client hit which limit, how often, per middleware. Traefik does not expose that
-granularity. Readiness probe only, matching the F# services.
+granularity.
+
+**None are implemented.** The store emits structured log events and nothing else, and that
+is the largest remaining gap before production. Three are worth alarming on, because none
+can be inferred from anything else:
+
+| Event | Means |
+|---|---|
+| `ScriptDiverged` | The proxy changed its algorithm in an upgrade |
+| `StoreAtCapacity` | Keys are being shed; some sources get fresh buckets |
+| `PeerEndpointUnauthenticated` | The mesh is writable by anything the network allows |
 
 ---
 
@@ -608,21 +707,73 @@ redis:
 Roughly 850 LOC and 5–7 days including the conformance harness. No `thiserror`, no
 `anyhow`, hand-rolled error enums, newtypes over the key and token types.
 
+**What it actually took: roughly 3,000 lines including tests.** The estimate counted the
+happy path and missed that most of the work is the parts that only matter when something is
+wrong — health and draining, the capacity backstop, the memory budget, peer authentication,
+and seven layers of test harness. The protocol and the arithmetic, which the estimate was
+mostly about, came in close to the guess.
+
 ---
 
-## When not to build this
+## 15. What building it changed
 
-Two changes already in flight attack the same problem far more cheaply, and they compose:
-IP-based keys cut the per-entry cost from ~1.75 KB to ~275 B, and the reload CronJob caps
-accumulation per interval.
+The design above is mostly what got built. These are the places it was wrong, kept because
+the corrections are more useful than a clean document.
 
-**Build it if** peak Traefik RSS still exceeds ~300 Mi after both land and the CronJob is
-already at six hours — meaning the growth is real rather than an artefact of key size.
+**An absent key yields a *full* bucket, not an empty one.** The missing state reads as
+`last = 0`, so the elapsed time is the whole timestamp and the refill saturates at burst —
+a lost counter admits its request rather than rejecting it. The first test written for this
+asserted the opposite and passed only because it used a toy timestamp near the epoch, where
+the refill is proportional instead of saturating.
 
-**Or build it if** Issue B is rejected upstream. Without B the divisor is not node count
-but `nodes × routers-per-middleware`, a different number per middleware that changes
-whenever a route is added. That arithmetic is unmaintainable and rots silently. The shim
-makes you immune to that outcome.
+**One pinned script text was wrong on arrival.** Two patch releases of the same minor
+version disagree on it (§4.1), found by diffing the branch against the tag while building
+the conformance probe.
 
-**Otherwise don't.** It trades a bounded memory problem for an unbounded availability one,
-and that trade only pays when the memory problem survives the cheap fixes.
+**The reference is less precise than this store.** It keeps the bucket as strings, and Lua
+stringifies with fourteen significant digits, so the stored timestamp is truncated to about
+180µs of granularity. The two therefore cannot agree exactly, and the differential test
+asserts they stay within a thousandth of the configured burst rather than to the bit.
+
+**Sweeping only ran when a shard was touched.** An idle or traffic-skewed store would have
+held expired entries indefinitely — Traefik's own bug in milder form. Reclamation is now
+timer-driven across every shard.
+
+**Ring rotation was a side effect of publishing**, so a replica running alone never rotated
+its consumption counters. Nothing read them, which is the only reason nothing broke.
+
+**The capacity ceiling sat above the memory limit** (§6.5), which made the backstop
+decoration: the process would have been killed before it ever trimmed.
+
+**The peer endpoint was documented as a throttling risk** when it is a bypass (§9.1).
+
+Two of those were found by a question rather than by a test — whether peer authentication
+was necessary, and whether hashing was worth it given the key size. Both questions were
+built on something this document had asserted wrongly.
+
+---
+
+## When to deploy this
+
+It is built. Whether to deploy it is a different question with a harder answer.
+
+Two cheaper changes attack the same problem and compose: IP-based keys cut the per-entry
+cost, and a reload CronJob caps accumulation per interval. Between them, reaching the
+ceiling on any single map needs that many distinct client addresses through one router
+inside one reload interval. **Measure before deploying.**
+
+**Deploy if** peak proxy memory still exceeds its budget after both land, or if a route
+genuinely needs one budget across all nodes — which, because keep-alive pins a client to
+one pod, is more often than the arithmetic suggests.
+
+**Only after re-tuning the limits.** Effective limits today are
+`configured x nodes x routers-per-middleware`; pointing a middleware at this store makes
+them `configured` exactly, a tightening of up to 102x. That is the breaking change of
+[#13706] arriving by choice rather than by upgrade, and production has never once run under
+the configured values, so nobody knows the real demand.
+
+**Gradually.** One low-traffic middleware first. The blast radius of anything still wrong
+is then one route rather than all of them, and it is the only honest way to learn the
+demand figure the point above depends on.
+
+[#13706]: https://github.com/traefik/traefik/issues/13706

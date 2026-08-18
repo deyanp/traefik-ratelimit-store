@@ -27,3 +27,6 @@ pub const PEER_ENDPOINT_UNAUTHENTICATED: (u32, &str) = (8007, "PeerEndpointUnaut
 
 /// The entry ceiling derived from the memory budget at startup.
 pub const STORE_CAPACITY_DERIVED: (u32, &str) = (8008, "StoreCapacityDerived");
+
+/// The store is at its entry ceiling and shedding the least recently active keys.
+pub const STORE_AT_CAPACITY: (u32, &str) = (8009, "StoreAtCapacity");

@@ -254,6 +254,18 @@ entry ceiling sized against the memory budget
 If your distinct-source count exceeds the middle column, raise the container limit; the
 ceiling follows on its own.
 
+**And if it is exceeded anyway?** The ceiling holds and the least recently active entries
+are shed. The flood evicts itself: a source seen once is the least recently active thing in
+the shard, while a source still sending is the last thing to go — so the client worth
+limiting stays limited, and the entries dropped belong to sources nowhere near their limit,
+which are re-admitted against a fresh bucket. Memory stays bounded, and the cost is
+amortized because a trim frees a tenth of a shard and cannot recur until that tenth
+refills.
+
+It logs `StoreAtCapacity` when this happens. **Alarm on it** — it is the one condition you
+cannot infer from anything else: memory looks fine, latency looks fine, and quietly some
+sources are being admitted against fresh buckets.
+
 Peer reports are capped at the busiest `PEER_MAX_KEYS_PER_REPORT` keys, because a report
 carries one entry per active key and a wide keyspace would otherwise mean megabytes to
 every peer several times a second. Truncating by consumption is what makes the cap safe: a
@@ -344,6 +356,11 @@ PASSED: 3 replicas enforced one shared limit behind real Traefik
 
 The cluster is deleted afterwards and the kubectl context is never switched. Pass
 `--keepCluster true` to inspect it.
+
+**Alarm on three log events.** No metrics are implemented; the store emits structured logs
+and nothing else, which is the largest gap remaining before production. `ScriptDiverged`
+means a proxy upgrade changed the algorithm. `StoreAtCapacity` means keys are being shed.
+`PeerEndpointUnauthenticated` means the mesh is writable by anything the network allows.
 
 **`conformance/soak.sh`** — sustained load with connection churn, watching for leaks. Every
 other measurement holds its connections open, which is the shape that hides a leak in
