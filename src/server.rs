@@ -4,7 +4,7 @@
 //! arrival order, which is what a pipelining client expects.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -12,7 +12,6 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::commands;
 use crate::errors::{ProtocolError, TechnicalError};
 use crate::log_events;
-use crate::peers::PeerTable;
 use crate::resp::{self, ParseOutcome};
 use crate::script::ScriptRegistry;
 use crate::store::BucketStore;
@@ -25,10 +24,15 @@ const READ_CHUNK: usize = 8 * 1024;
 /// so a client that never completes a command cannot consume memory indefinitely.
 const MAX_BUFFERED_REQUEST: usize = 1024 * 1024;
 
+/// How long the accept loop pauses after a failure that is not about one connection.
+///
+/// Running out of descriptors is the usual cause, and spinning on it would only burn the
+/// CPU that the connections already open need; the pause lets some of them finish.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Serves one connection until it closes or its framing is lost.
 async fn serve_connection(
     store: Arc<BucketStore>,
-    peers: Arc<PeerTable>,
     scripts: Arc<ScriptRegistry>,
     mut stream: TcpStream,
 ) -> Result<(), ProtocolError> {
@@ -55,7 +59,7 @@ async fn serve_connection(
             match resp::parse_command(&buffer[consumed_total..])? {
                 ParseOutcome::Incomplete => break,
                 ParseOutcome::Complete { args, consumed } => {
-                    let reply = commands::dispatch(&store, &peers, &scripts, &args, Instant::now());
+                    let reply = commands::dispatch(&store, &scripts, &args, Instant::now());
                     resp::encode_reply(&reply, &mut out);
                     consumed_total += consumed;
                 }
@@ -69,10 +73,27 @@ async fn serve_connection(
     }
 }
 
+/// Whether an accept failure concerned only the connection being accepted.
+///
+/// These are the peer going away between the kernel queueing it and this process taking
+/// it; the next accept is unaffected.
+fn is_connection_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
 /// Accepts connections until the process ends.
+///
+/// Only binding can fail. An accept that fails — the descriptor limit reached, a client
+/// gone before it was taken — is logged and retried: every one of those is transient, and
+/// exiting on it would trade a connection that could not be opened for every connection
+/// that already was.
 pub async fn run(
     store: Arc<BucketStore>,
-    peers: Arc<PeerTable>,
     scripts: Arc<ScriptRegistry>,
     listen_address: &str,
 ) -> Result<(), TechnicalError> {
@@ -89,19 +110,29 @@ pub async fn run(
     );
 
     loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .map_err(|e| TechnicalError(format!("failed to accept a connection: {e}")))?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) if is_connection_error(&error) => continue,
+            Err(error) => {
+                let (event_id, event_name) = log_events::ACCEPT_FAILED;
+                tracing::warn!(
+                    event_id,
+                    event_name,
+                    error = %error,
+                    "could not accept a connection; retrying"
+                );
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+        };
 
         // Small commands with immediate replies; batching them costs more than it saves.
         let _ = stream.set_nodelay(true);
 
         let store = store.clone();
-        let peers = peers.clone();
         let scripts = scripts.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(store, peers, scripts, stream).await {
+            if let Err(error) = serve_connection(store, scripts, stream).await {
                 let (event_id, event_name) = log_events::CONNECTION_PROTOCOL_ERROR;
                 tracing::warn!(event_id, event_name, %peer, error = %error, "closing connection");
             }

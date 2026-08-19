@@ -128,7 +128,15 @@ pub const KNOWN_SCRIPTS: &[(&str, &str)] = &[
 ];
 
 /// The digest of [`PINNED_SCRIPT`], computed once.
-pub static PINNED_SCRIPT_DIGEST: LazyLock<String> = LazyLock::new(|| compute_digest(PINNED_SCRIPT));
+pub static PINNED_SCRIPT_DIGEST: LazyLock<String> =
+    LazyLock::new(|| compute_digest(PINNED_SCRIPT.as_bytes()));
+
+/// How many digests of *unrecognised* sources the registry will remember.
+///
+/// A fleet part-way through an upgrade sends a handful of distinct texts at most. The
+/// bound exists because the protocol port is open to anything the network admits, and an
+/// unbounded set would let a caller grow this process's memory one `EVAL` at a time.
+pub const MAX_DIVERGED_SCRIPTS: usize = 16;
 
 /// What happened when a caller sent script source for evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,19 +145,35 @@ pub enum RegistrationOutcome {
     Matched(&'static str),
     /// The source matches nothing known. The request is still served with this store's
     /// arithmetic, because refusing would turn a caller upgrade into an outage — but the
-    /// semantics may have drifted and the operator needs to know.
-    Diverged,
+    /// semantics may have drifted and the operator needs to know. `first_seen` is true
+    /// the first time this particular text arrives, so the operator is told once per text
+    /// rather than once per request.
+    Diverged { first_seen: bool },
+    /// The source matches nothing known and the registry is full, so its digest is not
+    /// remembered: the request is served, and the next `EVALSHA` for it will be asked for
+    /// the source again.
+    Unregistered,
 }
 
 /// Returns the lowercase hexadecimal SHA-1 of `source`.
-pub fn compute_digest(source: &str) -> String {
-    hex::encode(Sha1::digest(source.as_bytes()))
+///
+/// Hashed as bytes, exactly as the caller computes it; decoding the source as text first
+/// would change the digest of anything that is not valid UTF-8.
+pub fn compute_digest(source: &[u8]) -> String {
+    hex::encode(Sha1::digest(source))
+}
+
+#[derive(Debug, Default)]
+struct Registrations {
+    known: HashSet<String>,
+    /// How many of `known` are unrecognised texts, held against [`MAX_DIVERGED_SCRIPTS`].
+    diverged: usize,
 }
 
 /// The digests this store answers to.
 #[derive(Debug, Default)]
 pub struct ScriptRegistry {
-    known: RwLock<HashSet<String>>,
+    registrations: RwLock<Registrations>,
 }
 
 impl ScriptRegistry {
@@ -161,26 +185,48 @@ impl ScriptRegistry {
     ///
     /// Deliberately empty at startup, so the first request provokes the source exchange
     /// that validates the caller's algorithm against the pinned one.
-    pub fn is_known(&self, digest: &str) -> bool {
-        self.known
+    pub fn is_known(&self, digest: &[u8]) -> bool {
+        let Ok(digest) = std::str::from_utf8(digest) else {
+            return false;
+        };
+
+        self.registrations
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .known
             .contains(digest)
     }
 
     /// Registers the digest of `source` and reports whether it matched a known text.
-    pub fn register_source(&self, source: &str) -> RegistrationOutcome {
+    pub fn register_source(&self, source: &[u8]) -> RegistrationOutcome {
         let digest = compute_digest(source);
-        self.known
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(digest);
-
-        KNOWN_SCRIPTS
+        let matched = KNOWN_SCRIPTS
             .iter()
-            .find(|(_, known)| *known == source)
-            .map(|(revision, _)| RegistrationOutcome::Matched(revision))
-            .unwrap_or(RegistrationOutcome::Diverged)
+            .find(|(_, known)| known.as_bytes() == source)
+            .map(|(revision, _)| *revision);
+
+        let mut registrations = self
+            .registrations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        match matched {
+            Some(revision) => {
+                registrations.known.insert(digest);
+                RegistrationOutcome::Matched(revision)
+            }
+            None if registrations.known.contains(&digest) => {
+                RegistrationOutcome::Diverged { first_seen: false }
+            }
+            None if registrations.diverged >= MAX_DIVERGED_SCRIPTS => {
+                RegistrationOutcome::Unregistered
+            }
+            None => {
+                registrations.known.insert(digest);
+                registrations.diverged += 1;
+                RegistrationOutcome::Diverged { first_seen: true }
+            }
+        }
     }
 }
 
@@ -190,7 +236,7 @@ mod tests {
 
     #[test]
     fn digest_is_lowercase_hex_of_forty_characters() {
-        let digest = compute_digest("anything");
+        let digest = compute_digest(b"anything");
 
         assert_eq!(digest.len(), 40);
         assert!(
@@ -204,17 +250,17 @@ mod tests {
     fn nothing_is_known_before_a_source_arrives() {
         let registry = ScriptRegistry::new();
 
-        assert!(!registry.is_known(&PINNED_SCRIPT_DIGEST));
+        assert!(!registry.is_known(PINNED_SCRIPT_DIGEST.as_bytes()));
     }
 
     #[test]
     fn the_pinned_source_registers_and_matches() {
         let registry = ScriptRegistry::new();
 
-        let outcome = registry.register_source(PINNED_SCRIPT);
+        let outcome = registry.register_source(PINNED_SCRIPT.as_bytes());
 
         assert_eq!(outcome, RegistrationOutcome::Matched("v3.7.1"));
-        assert!(registry.is_known(&PINNED_SCRIPT_DIGEST));
+        assert!(registry.is_known(PINNED_SCRIPT_DIGEST.as_bytes()));
     }
 
     #[test]
@@ -223,7 +269,7 @@ mod tests {
             let registry = ScriptRegistry::new();
 
             assert_eq!(
-                registry.register_source(source),
+                registry.register_source(source.as_bytes()),
                 RegistrationOutcome::Matched(revision),
                 "revision {revision} should be recognised"
             );
@@ -236,7 +282,7 @@ mod tests {
         // single pinned copy would reject callers running a neighbouring patch release.
         let digests: std::collections::HashSet<String> = KNOWN_SCRIPTS
             .iter()
-            .map(|(_, source)| compute_digest(source))
+            .map(|(_, source)| compute_digest(source.as_bytes()))
             .collect();
 
         assert_eq!(digests.len(), KNOWN_SCRIPTS.len());
@@ -247,10 +293,52 @@ mod tests {
         let registry = ScriptRegistry::new();
         let altered = format!("{PINNED_SCRIPT}\n-- upstream changed this");
 
-        let outcome = registry.register_source(&altered);
+        let outcome = registry.register_source(altered.as_bytes());
 
-        assert_eq!(outcome, RegistrationOutcome::Diverged);
+        assert_eq!(outcome, RegistrationOutcome::Diverged { first_seen: true });
         // Still served: an upgrade must not become an outage.
-        assert!(registry.is_known(&compute_digest(&altered)));
+        assert!(registry.is_known(compute_digest(altered.as_bytes()).as_bytes()));
+        // And reported once, not once per request.
+        assert_eq!(
+            registry.register_source(altered.as_bytes()),
+            RegistrationOutcome::Diverged { first_seen: false }
+        );
+    }
+
+    #[test]
+    fn the_registry_does_not_grow_without_bound() {
+        // The protocol port is open to anything the network admits, so a caller that sends
+        // a new text with every EVAL must not be able to grow this process one digest at a
+        // time. Beyond the bound the request is still served; the digest is just forgotten.
+        let registry = ScriptRegistry::new();
+
+        for index in 0..MAX_DIVERGED_SCRIPTS {
+            let source = format!("return {index}");
+            assert_eq!(
+                registry.register_source(source.as_bytes()),
+                RegistrationOutcome::Diverged { first_seen: true }
+            );
+        }
+
+        let one_more = b"return 'one more'";
+        assert_eq!(
+            registry.register_source(one_more),
+            RegistrationOutcome::Unregistered
+        );
+        assert!(!registry.is_known(compute_digest(one_more).as_bytes()));
+
+        // A known text is always registered, full or not.
+        assert_eq!(
+            registry.register_source(PINNED_SCRIPT.as_bytes()),
+            RegistrationOutcome::Matched("v3.7.1")
+        );
+    }
+
+    #[test]
+    fn the_digest_is_over_the_raw_bytes() {
+        // The caller hashes the bytes it sends; anything else would never match its digest.
+        let raw: &[u8] = &[0xff, 0xfe, b'x'];
+
+        assert_eq!(compute_digest(raw), hex::encode(Sha1::digest(raw)));
     }
 }

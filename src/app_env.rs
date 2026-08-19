@@ -22,13 +22,12 @@ pub struct AppEnv {
     /// Either a DNS name resolving to every peer, or a comma-separated list of addresses.
     /// Empty means this replica counts alone.
     pub peer_endpoint: String,
-    /// How often this replica publishes its consumption to peers.
+    /// How often this replica publishes its admissions to peers.
     pub peer_publish_interval: Duration,
-    /// How long a peer's report stays usable after it arrives.
-    pub peer_staleness_limit: Duration,
     /// How long a single delivery may take before it is abandoned.
     pub peer_request_timeout: Duration,
-    /// Most keys a single report carries, busiest first.
+    /// Most keys a single report carries, busiest first; also the most this replica will
+    /// accept in one inbound report.
     pub peer_max_keys_per_report: usize,
     /// Shared secret peers must present. Empty means the endpoint is unauthenticated and
     /// relies entirely on network policy.
@@ -69,16 +68,29 @@ fn read_usize(env_vars: &HashMap<String, String>, name: &str, fallback: usize) -
         .unwrap_or(fallback)
 }
 
+/// Refuses a value that would make a timer or a bound meaningless.
+///
+/// Each of these would otherwise fail later, inside a background task, where the failure
+/// is silent: a zero interval panics the timer that drives sweeping or publishing, and a
+/// zero shard count or ceiling panics the first request. Startup is where this belongs.
+fn require_positive(name: &str, value: u128) {
+    if value == 0 {
+        panic!("Environment variable {name} must be greater than zero!");
+    }
+}
+
 /// Refuses to start a meshed replica whose peer endpoint anyone can write to.
 ///
-/// An unauthenticated endpoint is a rate-limit bypass rather than a nuisance: reports are
-/// keyed by replica id and overwrite, so a stranger can send an empty report in a peer's
-/// name and erase that peer's consumption from this replica's view. Do that to each
-/// replica and every one believes it is alone.
+/// An unauthenticated endpoint is a rate-limit bypass rather than a nuisance: a report is
+/// folded into this replica's buckets exactly like a peer's, so a stranger who claims a
+/// timestamp far in the future refills a drained bucket, and one who claims admissions
+/// throttles a key at will. Do that to each replica and the limit is whatever the
+/// stranger says it is.
 ///
 /// Requiring a secret by default would be no safer — an unset secret would reject every
-/// report, age every peer out, and reach the same over-admission by a different route. So
-/// neither default is safe, and the only safe thing is to make the operator choose.
+/// report, and every replica would count alone, reaching over-admission by a different
+/// route. So neither default is safe, and the only safe thing is to make the operator
+/// choose.
 fn require_a_decision_about_peer_authentication(
     peer_endpoint: &str,
     peer_shared_secret: &str,
@@ -90,7 +102,7 @@ fn require_a_decision_about_peer_authentication(
 
     panic!(
         "PEER_ENDPOINT is set but PEER_SHARED_SECRET is not. An unauthenticated peer \
-         endpoint lets anyone erase a peer's consumption and lift the rate limit. Set \
+         endpoint lets anyone refill or drain any bucket on this replica. Set \
          PEER_SHARED_SECRET to the same value on every replica, or set \
          PEER_ALLOW_UNAUTHENTICATED=true to accept that risk deliberately."
     );
@@ -116,18 +128,38 @@ impl AppEnv {
         // beside it, because the two are one decision and setting them apart is how a
         // store gets killed while its own ceiling still reports headroom.
         let shard_count = read_usize(env_vars, "STORE_SHARD_COUNT", 16);
-        let budget_bytes = memory_budget::resolve_budget_bytes(
-            read_optional(env_vars, "STORE_MEMORY_BUDGET_MB").and_then(|v| v.parse().ok()),
-        );
+        require_positive("STORE_SHARD_COUNT", shard_count as u128);
+        let budget_mb = read_optional(env_vars, "STORE_MEMORY_BUDGET_MB")
+            .map(|_| read_usize(env_vars, "STORE_MEMORY_BUDGET_MB", 0));
+        if let Some(budget_mb) = budget_mb {
+            require_positive("STORE_MEMORY_BUDGET_MB", budget_mb as u128);
+        }
+        let budget_bytes = memory_budget::resolve_budget_bytes(budget_mb);
         let capacity_per_shard = read_optional(env_vars, "STORE_CAPACITY_PER_SHARD")
-            .and_then(|v| v.parse().ok())
+            .map(|_| read_usize(env_vars, "STORE_CAPACITY_PER_SHARD", 0))
             .unwrap_or_else(|| memory_budget::entries_per_shard(budget_bytes, shard_count));
+        require_positive("STORE_CAPACITY_PER_SHARD", capacity_per_shard as u128);
 
-        let store_config = StoreConfig {
-            shard_count,
-            capacity_per_shard,
-            sweep_interval: read_duration_millis(env_vars, "STORE_SWEEP_INTERVAL_MS", 1_000),
-        };
+        let sweep_interval = read_duration_millis(env_vars, "STORE_SWEEP_INTERVAL_MS", 1_000);
+        require_positive("STORE_SWEEP_INTERVAL_MS", sweep_interval.as_millis());
+
+        let peer_publish_interval = read_duration_millis(env_vars, "PEER_PUBLISH_INTERVAL_MS", 150);
+        require_positive(
+            "PEER_PUBLISH_INTERVAL_MS",
+            peer_publish_interval.as_millis(),
+        );
+        let peer_request_timeout = read_duration_millis(env_vars, "PEER_REQUEST_TIMEOUT_MS", 50);
+        require_positive("PEER_REQUEST_TIMEOUT_MS", peer_request_timeout.as_millis());
+        // A round of publishing waits for every delivery to finish or time out, so a
+        // timeout at or beyond the interval would make the publisher skip intervals.
+        if peer_request_timeout >= peer_publish_interval {
+            panic!(
+                "PEER_REQUEST_TIMEOUT_MS must be less than PEER_PUBLISH_INTERVAL_MS, \
+                 otherwise one slow peer delays every report!"
+            );
+        }
+        let peer_max_keys_per_report = read_usize(env_vars, "PEER_MAX_KEYS_PER_REPORT", 10_000);
+        require_positive("PEER_MAX_KEYS_PER_REPORT", peer_max_keys_per_report as u128);
 
         Self {
             app_name: read_or_default(env_vars, "APPNAME", "traefik-ratelimit-store"),
@@ -135,12 +167,15 @@ impl AppEnv {
             listen_address: read_or_default(env_vars, "LISTEN_ADDRESS", "0.0.0.0:6379"),
             peer_listen_address: read_or_default(env_vars, "PEER_LISTEN_ADDRESS", "0.0.0.0:8080"),
             peer_endpoint,
-            peer_publish_interval: read_duration_millis(env_vars, "PEER_PUBLISH_INTERVAL_MS", 150),
-            peer_staleness_limit: read_duration_millis(env_vars, "PEER_STALENESS_LIMIT_MS", 1_000),
-            peer_request_timeout: read_duration_millis(env_vars, "PEER_REQUEST_TIMEOUT_MS", 50),
-            peer_max_keys_per_report: read_usize(env_vars, "PEER_MAX_KEYS_PER_REPORT", 10_000),
+            peer_publish_interval,
+            peer_request_timeout,
+            peer_max_keys_per_report,
             peer_shared_secret,
-            store: store_config,
+            store: StoreConfig {
+                shard_count,
+                capacity_per_shard,
+                sweep_interval,
+            },
         }
     }
 }
@@ -275,5 +310,70 @@ mod tests {
         assert_eq!(env.peer_endpoint, "peers.svc:8080");
         assert_eq!(env.peer_publish_interval, Duration::from_millis(250));
         assert_eq!(env.store.shard_count, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "STORE_SHARD_COUNT must be greater than zero")]
+    fn a_zero_shard_count_is_refused_at_startup() {
+        AppEnv::create(&HashMap::from([(
+            "STORE_SHARD_COUNT".to_string(),
+            "0".to_string(),
+        )]));
+    }
+
+    #[test]
+    #[should_panic(expected = "STORE_CAPACITY_PER_SHARD must be greater than zero")]
+    fn a_zero_ceiling_is_refused_at_startup() {
+        AppEnv::create(&HashMap::from([(
+            "STORE_CAPACITY_PER_SHARD".to_string(),
+            "0".to_string(),
+        )]));
+    }
+
+    #[test]
+    #[should_panic(expected = "PEER_PUBLISH_INTERVAL_MS must be greater than zero")]
+    fn a_zero_publish_interval_is_refused_at_startup() {
+        AppEnv::create(&HashMap::from([(
+            "PEER_PUBLISH_INTERVAL_MS".to_string(),
+            "0".to_string(),
+        )]));
+    }
+
+    #[test]
+    #[should_panic(expected = "STORE_SWEEP_INTERVAL_MS must be greater than zero")]
+    fn a_zero_sweep_interval_is_refused_at_startup() {
+        AppEnv::create(&HashMap::from([(
+            "STORE_SWEEP_INTERVAL_MS".to_string(),
+            "0".to_string(),
+        )]));
+    }
+
+    #[test]
+    #[should_panic(expected = "PEER_MAX_KEYS_PER_REPORT must be greater than zero")]
+    fn a_zero_report_cap_is_refused_at_startup() {
+        AppEnv::create(&HashMap::from([(
+            "PEER_MAX_KEYS_PER_REPORT".to_string(),
+            "0".to_string(),
+        )]));
+    }
+
+    #[test]
+    #[should_panic(expected = "PEER_REQUEST_TIMEOUT_MS must be less than PEER_PUBLISH_INTERVAL_MS")]
+    fn a_delivery_timeout_longer_than_the_interval_is_refused_at_startup() {
+        AppEnv::create(&HashMap::from([
+            ("PEER_PUBLISH_INTERVAL_MS".to_string(), "100".to_string()),
+            ("PEER_REQUEST_TIMEOUT_MS".to_string(), "100".to_string()),
+        ]));
+    }
+
+    #[test]
+    #[should_panic(expected = "STORE_MEMORY_BUDGET_MB must be a whole number")]
+    fn a_malformed_budget_is_refused_rather_than_ignored() {
+        // Silently falling back to the cgroup limit would hide a typo in the one setting
+        // that decides whether the process fits its container.
+        AppEnv::create(&HashMap::from([(
+            "STORE_MEMORY_BUDGET_MB".to_string(),
+            "128Mi".to_string(),
+        )]));
     }
 }

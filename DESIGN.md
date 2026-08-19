@@ -289,7 +289,12 @@ Two families exist in the prior art:
   convergence.
 
 **We take count sharing**, because it is correct in both traffic regimes while
-demand-share is correct in only one.
+demand-share is correct in only one — with one correction to Caddy's shape, recorded in
+§7.2 and §15: the count a peer reports is *debited from the local bucket*, not compared
+against the limit at decision time. Caddy's per-request comparison works because Caddy's
+limiter *is* a sliding-window count; a token bucket that refills independently on every
+replica needs the peers' admissions folded into its level, or each replica refills the
+whole rate for itself.
 
 A key's traffic can be spread across replicas or concentrated on one. Both occur here.
 Spread is in fact the normal case: each Traefik pod holds ~251 connection pools all
@@ -299,10 +304,11 @@ hopping between Traefik pods — keep-alive connections closing, parallel connec
 pods rolling — adds to that rather than causing it. Concentration still happens whenever
 a single client sustains one connection.
 
-| Regime | Count sharing | Demand-share allocation |
+| Regime | Admission sharing | Demand-share allocation |
 |---|---|---|
 | Spread | Correct, error bounded by one interval | Correct, converges to fair shares |
-| Concentrated | Correct immediately — peers report ~0, so the node enforces the full limit | Throttles the client to 1/N until the next refresh |
+| Concentrated | Correct immediately — peers report nothing, so the node enforces the full limit | Throttles the client to 1/N until the next refresh |
+| Moving between replicas | Correct — every replica's level already reflects the others' admissions | Re-converges after a refresh cycle |
 
 Doorman is built for many clients with sustained spread demand against a shared resource,
 where a refresh cycle of latency is irrelevant. Ours is bursty and short-lived per key.
@@ -310,30 +316,41 @@ Count sharing is right in both regimes and is far simpler.
 
 ### 7.2 Payload
 
-Each interval, every replica publishes only the keys it touched:
+Each interval, every replica publishes what it admitted since its previous report, for the
+keys it touched:
 
 ```
-replica_id, timestamp_micros,
-keys: { key_hash -> tokens_consumed_in_trailing_window }
+replica_id,
+keys: [ { key_hash, admitted, last, limit, burst, ttl_ms } ]
 ```
 
-Per request:
+On receipt, per line, the receiver folds the admissions into its own bucket as of `last`:
 
 ```
-total   = own_consumed(K) + Σ fresh_peers.consumed(K)
-available = refill_since_epoch(K) − total
-allow if available >= 1
+level = min(stored + limit × (last − stored.last), burst) − admitted
 ```
+
+— refill up to the moment the peer admitted them, then subtract, exactly as a local
+request would have done. A key the receiver has not seen is taken as full at `last`. The
+`limit`/`burst` travel with the line so a key only peers have touched can be folded at all;
+a key the receiver has seen is folded with the configuration it saw itself. Per request,
+nothing about peers is consulted: the bucket already reflects them.
 
 Four decisions inside that:
 
-- **Consumption, not bucket state.** `(last, tokens)` does not merge — max-merging loses
-  concurrent increments and would allow up to N×. Consumption is additive; it does.
-- **Staleness guard.** Ignore any peer whose timestamp is older than the window. Copied
-  from Caddy, and it is what makes a missed or delayed peer report safe rather than
-  silently wrong.
-- **Full state per interval, not deltas.** Self-healing: a dropped message costs one
-  interval instead of leaving permanent drift. Only active keys are included.
+- **Admissions, not bucket state.** `(last, tokens)` does not merge — max-merging loses
+  concurrent increments and would allow up to N×. Admissions are tokens taken from one
+  logical bucket; debiting them everywhere keeps every copy tracking that bucket.
+- **Debit the level, do not offset the decision.** The first version subtracted peers'
+  recent consumption from each decision and left the stored level alone. That shares the
+  burst and nothing else: every replica still refills at the full rate, and under sustained
+  spread traffic the deployment admits N × rate while the burst tests pass (§15). Folding
+  the admissions into the level is what makes the rate shared.
+- **Deltas since the last report, applied once.** There is no peer table, no staleness
+  window and no reconciliation: a report is folded on arrival and forgotten. A lost report
+  costs its peers one interval of one replica's admissions — the same one-interval error
+  the cadence already allows — and a silent peer costs nothing but its own future
+  admissions.
 - **Interval 100–250 ms.** Caddy's 5 s default is uselessly coarse against `period: 10s`
   with `burst: 10`. At 3 replicas that is 6 messages per interval.
 
@@ -345,7 +362,7 @@ N² is prohibitive at large N. At three replicas full mesh is simpler *and* lowe
 — one hop instead of several rounds.
 
 **Every pod sends the same message to every other pod, every interval.** Per interval a
-pod resolves the headless Service, builds one payload of its own consumption, and POSTs
+pod resolves the headless Service, builds one payload of its own admissions, and POSTs
 that identical payload to each peer. Total messages per interval is `N × (N−1)` — six at
 three replicas, a few hundred bytes each.
 
@@ -386,65 +403,64 @@ abstraction. A hop through storage would add latency for nothing here.
 
 ### 7.4 No merge logic is required
 
-Each pod broadcasts only *its own* consumption, so every peer's slot is owned exclusively
-by that peer:
-
-```
-peers: HashMap<replica_id, PeerReport>       // overwrite on arrival
-PeerReport = { timestamp, keys: HashMap<key_hash, consumed> }
-```
-
-The exclusivity is over the **cell** `(replica_id, key)`, not over the key. The same key
-routinely appears in several reports:
-
-```
-peers[A] = { ts: …, keys: { K: 5 } }
-peers[B] = { ts: …, keys: { K: 3 } }
-total(K) = 8
-```
-
-What never happens is two writers touching `peers[A].keys[K]`. Last-write-wins per
-replica, summation at read time on the request path. The structure is a G-Counter, but
-trivially so — there is no contention and therefore no CRDT merge to implement.
+Each pod broadcasts only *its own* admissions, and the receiver folds them straight into
+its bucket. There is no per-peer table at all: the sum that Caddy computes at read time
+across `peers[A].keys[K]`, `peers[B].keys[K]` happens here once, at receipt, as a debit —
+and because the debit is applied to the level rather than kept beside it, the same key
+appearing in several reports needs no reconciliation. The structure is still a G-Counter,
+only materialised into the bucket instead of stored next to it.
 
 Contrast with broadcasting bucket state: if A reported `tokens=5` and B `tokens=3` for the
 *same* logical cell, the receiver would have to choose — max, min, average — and every
-choice loses information. That is the merge problem, and per-replica consumption is what
-avoids it.
+choice loses information. That is the merge problem, and per-replica admissions are what
+avoid it.
 
-A restarted pod that loses its counts simply reports its post-restart consumption. Because
-the payload is *consumption in a trailing window* rather than a cumulative total, that is
-correct with no monotonicity requirement — a further reason windowed beats cumulative.
+A restarted pod reports only what it admits after restarting, which is all a peer needs.
+Nothing is cumulative, so there is no monotonicity requirement and no epoch to carry.
 
 ### 7.5 Publish-loop rules
 
-- **Never retry a failed POST.** Retrying stale state is worse than sending fresh state
-  one interval later. Drop it; the peer ages out of the staleness window on its own.
+- **Never retry a failed POST.** A retry would deliver an old report after a fresher one
+  is already due. Drop it; the peer is behind by one interval of this replica's admissions
+  and no more.
 - **Publish concurrently**, so one slow peer cannot delay the others.
 - **Tight per-peer timeout**, around 50 ms, so a hung peer cannot stall the loop.
-- **Fire-and-forget.** The response carries nothing; do not wait on it.
+- **Fire-and-forget, but read the status.** The response carries no data, but a `401` or
+  `413` means the peer is discarding every report — a secret that differs between replicas,
+  a report cap raised past the body limit — and a mesh that silently counts alone is the
+  failure this store exists to prevent. Any non-success is a rejection and is logged when
+  it starts and when it clears; "no peer answered" likewise.
+- **Resolve asynchronously, once per interval.** The resolver must never hold a runtime
+  worker, because the same workers serve the protocol connections; a slow CoreDNS would
+  otherwise stall requests into the proxy's 200 ms read timeout.
 
 Switch to real gossip only if replica count passes roughly 15–20, where `N × (N−1)`
 starts to matter. At three it does not.
 
 ### 7.6 Accuracy
 
-Overshoot is bounded by `(N−1) × rate × interval`. Because spread is the normal case
-(§7.1), this applies routinely rather than only under attack — and it scales with the
-**configured rate**, so the interval must be sized against the highest limit in use:
+Two regimes, two bounds.
 
-| Configured limit | N=3, interval 150 ms | Overshoot |
+**Sustained traffic admits the configured rate, however it is spread.** Every replica's
+level is debited by every admission in the deployment and refilled once by time, so the
+deployment behaves as one bucket up to the delay of one exchange. The cucumber suite drives
+20 requests per second for 60 seconds at `30 per 10s, burst 10` across three replicas and
+admits 190–192 — burst plus rate × time is 190 — spread evenly, concentrated on one
+replica, or moving between them.
+
+**A burst can be admitted once per replica before the first reports land.** Requests that
+arrive within one interval of each other are decided before any peer hears of them, so the
+instantaneous overshoot is bounded by `(N−1) × burst` per key, and at steady state by
+`(N−1) × rate × interval`:
+
+| Configured limit | N=3, interval 150 ms | Steady-state overshoot |
 |---|---|---|
 | 3 rps (`average: 30 / period: 10s`) | 2 × 3 × 0.15 | 0.9 requests |
 | 100 rps | 2 × 100 × 0.15 | 30 requests |
 
-At current limits that is under one request. If a high-rate middleware is ever added, the
-interval has to come down with it, or the overshoot becomes a material fraction of the
-budget. Write this constraint into the config validation rather than discovering it
-later.
-
-Caddy leaves a `TODO` about extrapolating a peer's count from how stale its report is.
-Worth knowing; not worth building in v1.
+The store cannot validate this at startup — it does not know the middlewares' rates, which
+arrive per request — so it is a sizing rule for the operator: if a high-rate middleware is
+added, the interval comes down with it.
 
 ---
 
@@ -464,8 +480,8 @@ which is why this is easier than a Valkey cluster rather than harder.
 
 Three replicas, anti-affinity, a PodDisruptionBudget. No StatefulSet, no PVC.
 
-Pod loss is invisible because survivors already hold their own counts and the dead peer
-simply ages out of the staleness window. Connection breaks are absorbed by go-redis,
+Pod loss is invisible because every survivor's buckets already reflect what the dead peer
+admitted, and nothing further is expected of it. Connection breaks are absorbed by go-redis,
 whose `shouldRetry` returns true for `io.EOF`, `io.ErrUnexpectedEOF` and non-timeout
 network errors including connection-refused.
 
@@ -544,24 +560,27 @@ only the routes that genuinely need cross-node budgets on the shim.
 
 ### 9.1 The peer endpoint is a bypass if left open
 
-This was documented backwards at first, and the correction matters. Reports are keyed by
-replica id and **overwrite**, so a stranger who reaches the endpoint and knows a replica's
-id — a pod name — can send an empty report in its name and erase that replica's consumption
-from every peer's view. Do that to each replica and every one believes it is alone: N times
-the configured limit, which is the exact failure this store exists to prevent.
-
-Demonstrated against a running store: a peer honestly reporting ten tokens taken produces a
-333ms delay for the next request; a forged empty report in that peer's name drops it to
-zero.
+This was documented backwards at first, and the correction matters. A report is folded into
+the receiver's buckets exactly like a peer's, so a stranger who reaches the endpoint can
+claim admissions for a key and throttle it, or claim a timestamp far in the future and
+refill a drained bucket — the level refills up to the claimed moment before the debit. Do
+that to each replica and the limit is whatever the stranger says it is.
 
 A NetworkPolicy is the other half rather than a substitute — k3s and k3d ship flannel, which
-does not enforce NetworkPolicy at all.
+does not enforce NetworkPolicy at all. The shipped manifest carries one anyway, and it
+matters more for the protocol port: `AUTH` is accepted unconditionally, so anything that can
+reach 6379 can drive any bucket directly.
 
 **Neither default is safe, so there is no default.** Requiring a secret that has not been
-configured would reject every report, age every peer out, and reach the same over-admission
-by another route. A replica with `PEER_ENDPOINT` set and no `PEER_SHARED_SECRET` therefore
-refuses to start, naming both ways out; `PEER_ALLOW_UNAUTHENTICATED=true` records the
-decision in configuration rather than letting it happen by omission.
+configured would reject every report, leave every replica counting alone, and reach the
+same over-admission by another route. A replica with `PEER_ENDPOINT` set and no
+`PEER_SHARED_SECRET` therefore refuses to start, naming both ways out;
+`PEER_ALLOW_UNAUTHENTICATED=true` records the decision in configuration rather than letting
+it happen by omission.
+
+The receiver checks the secret before it parses a body, caps what one report may carry at
+the same `PEER_MAX_KEYS_PER_REPORT` the sender applies, and skips any line it cannot fold
+safely — a non-finite number, a non-positive limit, a malformed key.
 
 ---
 
@@ -572,7 +591,7 @@ client hit which limit, how often, per middleware. Traefik does not expose that
 granularity.
 
 **None are implemented.** The store emits structured log events and nothing else, and that
-is the largest remaining gap before production. Three are worth alarming on, because none
+is the largest remaining gap before production. These are worth alarming on, because none
 can be inferred from anything else:
 
 | Event | Means |
@@ -580,6 +599,10 @@ can be inferred from anything else:
 | `ScriptDiverged` | The proxy changed its algorithm in an upgrade |
 | `StoreAtCapacity` | Keys are being shed; some sources get fresh buckets |
 | `PeerEndpointUnauthenticated` | The mesh is writable by anything the network allows |
+| `PeerPublishRejected` | Peers refuse this replica's reports — the mesh is silently counting alone |
+| `PeerPublishFailed` / `PeerDiscoveryEmpty` | No peer can be reached, or the endpoint resolves to nothing |
+| `BackgroundTaskStopped` | The sweeper, publisher or peer endpoint died; the process is exiting |
+| `AcceptFailed` | Connections cannot be accepted, usually the descriptor limit |
 
 ---
 
@@ -624,8 +647,12 @@ production never sees. A corpus built around `now ≈ 1.78e15` exercises the rea
 ### 11.3 Mesh accuracy — statistical, not differential
 
 Multi-replica behaviour is approximate by design, so it needs its own test: drive known
-load across N replicas and assert the total lands within `(N−1) × rate × interval`. Do not
-try to make the differential test cover both — scope that one to a single replica.
+load across N replicas and assert the total. Two shapes, because they fail differently: a
+burst at one instant, where the bound is the exchange interval, and sustained traffic over
+a minute — spread, concentrated, and moving between replicas — where the total must be
+burst plus rate × time. The first version passed the burst scenarios and admitted three
+times the rate under the sustained ones (§15). Do not try to make the differential test
+cover both — scope that one to a single replica.
 
 Cucumber features for behaviour, per the house Rust testing conventions.
 
@@ -700,7 +727,7 @@ redis:
 | Handshake quirks | ~60 LOC |
 | Bucket + sharded store + sweeper | ~200 LOC |
 | Script registry + self-validation | ~80 LOC |
-| Gossip: publish, fetch, merge, staleness | ~250 LOC |
+| Mesh: publish, receive, fold | ~250 LOC |
 | Probes + metrics | ~80 LOC |
 | Manifests | ~120 lines YAML |
 
@@ -742,10 +769,28 @@ timer-driven across every shard.
 **Ring rotation was a side effect of publishing**, so a replica running alone never rotated
 its consumption counters. Nothing read them, which is the only reason nothing broke.
 
+**Count sharing shared the burst and nothing else.** The first version subtracted peers'
+recent consumption from each *decision* and left each replica's stored level alone — Caddy's
+shape, which is right for Caddy because Caddy's limiter is a sliding-window count. A token
+bucket that refills independently on every replica is not: once each level sat at the
+raised threshold, every refilled token was spent locally, and under sustained spread
+traffic three replicas admitted 552 requests in a minute against an ideal of 190 — N × rate,
+with every burst scenario green. Found in review, by simulation, not by a test; the test
+suite only froze time. Admissions are now *debited from the level* at the moment they
+happened, which makes every replica's copy track the one shared bucket; the sustained
+scenarios are in the suite, and the windowed ring, the peer table and the staleness window
+all went with the old model.
+
 **The capacity ceiling sat above the memory limit** (§6.5), which made the backstop
 decoration: the process would have been killed before it ever trimmed.
 
 **The peer endpoint was documented as a throttling risk** when it is a bypass (§9.1).
+
+**Four things could kill a background task silently, and nothing watched.** A zero
+interval panicked the timer, a zero ceiling or report cap panicked the first insert or
+publish, a TTL large enough overflowed the clock, and an accept error — the descriptor limit
+— exited the process. Each is now refused at startup or handled where it happens, and the
+sweeper, publisher and peer endpoint are supervised: the first to stop ends the process.
 
 Two of those were found by a question rather than by a test — whether peer authentication
 was necessary, and whether hashing was worth it given the key size. Both questions were

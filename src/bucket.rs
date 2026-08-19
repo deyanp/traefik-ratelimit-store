@@ -31,11 +31,6 @@ pub struct BucketParams {
     pub now: f64,
     /// The longest wait the caller will accept, in microseconds.
     pub max_delay: f64,
-    /// Tokens other replicas report having taken for this key recently.
-    ///
-    /// Subtracted from the decision but never from the stored state, so it cannot
-    /// compound across requests. Zero when this replica counts alone.
-    pub peer_consumed: f64,
 }
 
 /// The result of admitting one request against a bucket.
@@ -68,16 +63,11 @@ pub fn apply_request(previous: Option<BucketState>, params: &BucketParams) -> Bu
     let elapsed = params.now - last;
     let refilled = (stored + params.limit * elapsed).min(params.burst);
 
-    // What this replica stores is its own view: peers' consumption is a fact about the
-    // present moment, not state to carry forward, so it never enters the stored value.
     let mut tokens = refilled - 1.0;
 
-    // What this replica decides on also accounts for what peers have taken.
-    let available = refilled - params.peer_consumed - 1.0;
-
     let mut wait = 0.0;
-    if available < 0.0 {
-        wait = -available / params.limit;
+    if tokens < 0.0 {
+        wait = -tokens / params.limit;
         if wait > params.max_delay {
             // The caller will be rejected rather than made to wait, so the token it could
             // not use is returned to the bucket.
@@ -91,6 +81,46 @@ pub fn apply_request(previous: Option<BucketState>, params: &BucketParams) -> Bu
             tokens,
         },
         wait,
+    }
+}
+
+/// Folds admissions another replica made into this bucket, as of the moment they happened.
+///
+/// A peer's admission is a token taken from the same logical bucket, so it is debited
+/// here exactly as a local request would have been: refill up to `at`, then subtract.
+/// Debiting the stored state — rather than offsetting each later decision — is what makes
+/// the limit hold under sustained traffic: every replica's level then tracks the one
+/// shared level, and each refills it at the configured rate only once.
+///
+/// `limit` and `burst` are the peer's view of the configuration, carried with the report
+/// because the debit has to be folded before this replica necessarily sees a request for
+/// the key itself. They are used for this fold only and never stored. An absent bucket is
+/// taken as full at `at`, which is what a key this replica has not seen would have held.
+pub fn apply_peer_admissions(
+    previous: Option<BucketState>,
+    admitted: f64,
+    at: f64,
+    limit: f64,
+    burst: f64,
+) -> BucketState {
+    match previous {
+        None => BucketState {
+            last: at,
+            tokens: burst - admitted,
+        },
+        // Admissions that predate the last local request are debited as of that request:
+        // the level carried forward from it simply was `admitted` lower than stored.
+        Some(state) if at <= state.last => BucketState {
+            last: state.last,
+            tokens: state.tokens - admitted,
+        },
+        Some(state) => {
+            let refilled = (state.tokens + limit * (at - state.last)).min(burst);
+            BucketState {
+                last: at,
+                tokens: refilled - admitted,
+            }
+        }
     }
 }
 
@@ -114,7 +144,6 @@ mod tests {
             burst: BURST,
             now,
             max_delay: MAX_DELAY,
-            peer_consumed: 0.0,
         }
     }
 
@@ -178,50 +207,72 @@ mod tests {
     }
 
     #[test]
-    fn peer_consumption_tightens_the_decision() {
+    fn peer_admissions_debit_the_stored_level() {
         let previous = BucketState {
             last: 1_000_000.0,
             tokens: 5.0,
         };
-        let mut params = params_at(1_000_000.0);
-        params.peer_consumed = 4.0;
 
-        let outcome = apply_request(Some(previous), &params);
+        // A peer admitted four requests at the same instant. They came out of the same
+        // logical bucket, so the stored level drops by four — and stays dropped.
+        let state = apply_peer_admissions(Some(previous), 4.0, 1_000_000.0, LIMIT, BURST);
+        assert_eq!(state.tokens, 1.0);
 
-        // Locally there were 5 tokens, so alone this would pass with room to spare. With
-        // four taken by peers only one remains, and this request is the one that takes it.
+        let outcome = apply_request(Some(state), &params_at(1_000_000.0));
         assert_eq!(outcome.wait, 0.0);
-        // The stored value reflects this replica's own view, untouched by the peer term,
-        // so the deduction cannot compound on the next request.
-        assert_eq!(outcome.state.tokens, 4.0);
+        assert_eq!(outcome.state.tokens, 0.0);
     }
 
     #[test]
-    fn peer_consumption_can_exhaust_a_locally_full_bucket() {
-        let previous = BucketState {
-            last: 1_000_000.0,
-            tokens: 2.0,
-        };
-        let mut params = params_at(1_000_000.0);
-        params.peer_consumed = 10.0;
-
-        let outcome = apply_request(Some(previous), &params);
-
-        // Peers have taken far more than the bucket holds, so the caller must wait.
-        assert!(outcome.wait > 0.0);
-    }
-
-    #[test]
-    fn a_lone_replica_is_unaffected_by_the_peer_term() {
+    fn peer_admissions_are_refilled_up_to_when_they_happened() {
         let previous = BucketState {
             last: 1_000_000.0,
             tokens: 0.0,
         };
 
-        // peer_consumed defaults to zero in params_at, which is the lone-replica case.
-        let outcome = apply_request(Some(previous), &params_at(1_200_000.0));
+        // Two seconds later a peer takes three tokens. By then the bucket had refilled six,
+        // so the level after the debit is three, not minus three.
+        let state = apply_peer_admissions(Some(previous), 3.0, 3_000_000.0, LIMIT, BURST);
 
-        assert!(is_close(outcome.state.tokens, -0.4));
+        assert!(is_close(state.tokens, 3.0));
+        assert_eq!(state.last, 3_000_000.0);
+    }
+
+    #[test]
+    fn peer_admissions_before_the_last_local_request_debit_that_request() {
+        let previous = BucketState {
+            last: 2_000_000.0,
+            tokens: 5.0,
+        };
+
+        // The peer's admissions predate the state this replica holds, so they are applied
+        // to it directly: the level this replica carried was two lower than it thought.
+        let state = apply_peer_admissions(Some(previous), 2.0, 1_000_000.0, LIMIT, BURST);
+
+        assert_eq!(state.tokens, 3.0);
+        assert_eq!(state.last, 2_000_000.0);
+    }
+
+    #[test]
+    fn peer_admissions_against_an_unseen_key_start_from_a_full_bucket() {
+        let state = apply_peer_admissions(None, 4.0, REALISTIC_NOW, LIMIT, BURST);
+
+        assert_eq!(state.tokens, BURST - 4.0);
+        assert_eq!(state.last, REALISTIC_NOW);
+    }
+
+    #[test]
+    fn peer_admissions_can_exhaust_a_locally_full_bucket() {
+        let previous = BucketState {
+            last: 1_000_000.0,
+            tokens: 10.0,
+        };
+
+        let state = apply_peer_admissions(Some(previous), 10.0, 1_000_000.0, LIMIT, BURST);
+        let outcome = apply_request(Some(state), &params_at(1_000_000.0));
+
+        // Peers have taken everything the bucket held, so the caller must wait.
+        assert!(outcome.wait > 0.0);
     }
 
     #[test]

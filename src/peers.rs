@@ -1,232 +1,257 @@
-//! What peers tell each other, and what a replica does with it.
+//! What peers tell each other.
 //!
-//! Replicas share **consumption**, not bucket state. Bucket state does not merge — taking
+//! Replicas share **admissions**, not bucket state. Bucket state does not merge — taking
 //! the newest or the largest of two `(last, tokens)` pairs discards one replica's
 //! increments, which is precisely the over-admission the sharing exists to prevent.
-//! Counts add, so they do merge.
+//! Admissions are tokens taken from the one logical bucket, so a peer can debit them from
+//! its own copy exactly as if the requests had arrived there. That keeps every replica's
+//! level tracking the shared one, and it is what makes the limit hold under sustained
+//! traffic rather than only across a single burst.
 //!
-//! No merge logic is needed even so. A replica only ever publishes its own consumption,
-//! so each entry in the table is written by exactly one author and arriving reports
-//! overwrite rather than combine. The summing happens at read time, on the request path.
+//! Each report carries what this replica admitted *since its last report*, so applying a
+//! report once is the whole protocol: there is no table to reconcile and nothing to age
+//! out. A report that is lost costs its peers that interval's admissions, which is the
+//! same one-interval error the exchange cadence already allows.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::KeyHash;
+use crate::store::{KeyHash, KeyReport, PeerAdmissions};
 
-/// One replica's account of what it has taken recently.
+/// Longest replica id accepted on the wire. Hostnames are far shorter; anything longer is
+/// not a peer.
+const MAX_REPLICA_ID_LENGTH: usize = 256;
+
+/// Longest lifetime a peer may ask this replica to hold an entry for. The caller derives
+/// lifetimes of a few seconds from the rate; a day is far beyond anything legitimate.
+const MAX_REPORTED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One key's admissions, as they travel.
 ///
-/// Keys travel as hexadecimal because a map key must be a string in JSON; the value is
-/// tokens consumed within the trailing window, not since startup, so a restarted replica
-/// needs no recovery and no monotonicity.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// The key is hexadecimal because it is a digest, not a string. `last`, `limit` and
+/// `burst` let the receiver fold the admissions into its own bucket as of the moment they
+/// happened, even for a key it has not seen itself.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct KeyAdmissions {
+    pub key: String,
+    pub admitted: u32,
+    pub last: f64,
+    pub limit: f64,
+    pub burst: f64,
+    pub ttl_ms: u64,
+}
+
+/// One replica's account of what it admitted since its previous report.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PeerReport {
     pub replica_id: String,
-    pub keys: HashMap<String, u32>,
+    pub keys: Vec<KeyAdmissions>,
 }
 
 impl PeerReport {
-    pub fn new(replica_id: String, consumption: &HashMap<KeyHash, u32>) -> Self {
+    pub fn new(replica_id: String, lines: &[KeyReport]) -> Self {
         Self {
             replica_id,
-            keys: consumption
+            keys: lines
                 .iter()
-                .map(|(key, count)| (key.to_hex(), *count))
+                .map(|line| KeyAdmissions {
+                    key: line.key.to_hex(),
+                    admitted: line.admitted,
+                    last: line.last,
+                    limit: line.limit,
+                    burst: line.burst,
+                    ttl_ms: line.ttl.as_millis().try_into().unwrap_or(u64::MAX),
+                })
                 .collect(),
         }
     }
 }
 
-/// A report as held by the receiver, with the moment it arrived.
-#[derive(Clone, Debug)]
-struct StoredReport {
-    /// Stamped by the receiver, never by the sender.
-    ///
-    /// Staleness is therefore measured on one clock, so peers need no clock
-    /// synchronisation and a skewed sender cannot make its report look fresh.
-    received_at: Instant,
-    keys: HashMap<KeyHash, u32>,
+/// Why a report was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportError {
+    /// The replica id is empty or longer than any hostname.
+    InvalidReplicaId,
+    /// More keys than this replica is prepared to fold from one report.
+    TooManyKeys(usize),
 }
 
-/// What every peer has recently reported.
-#[derive(Debug, Default)]
-pub struct PeerTable {
-    /// Keyed by replica id, and each replica writes only its own entry — so this is
-    /// last-write-wins per author with no contention and nothing to reconcile.
-    reports: RwLock<HashMap<String, StoredReport>>,
-    staleness_limit: Duration,
+impl std::fmt::Display for ReportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidReplicaId => write!(f, "replica id is empty or too long"),
+            Self::TooManyKeys(count) => write!(f, "report carries {count} keys, over the limit"),
+        }
+    }
 }
 
-impl PeerTable {
-    pub fn new(staleness_limit: Duration) -> Self {
-        Self {
-            reports: RwLock::new(HashMap::new()),
-            staleness_limit,
-        }
+/// Turns a received report into the admissions to fold, dropping lines that cannot be
+/// applied safely.
+///
+/// Returns `Ok(empty)` for this replica's own echo — a replica may publish to itself,
+/// since one loopback request per interval is cheaper than the machinery to avoid it, and
+/// it recognises the echo by its own id.
+///
+/// A line with a non-finite number, a non-positive `limit`, or a malformed key is skipped
+/// rather than failing the report: one bad line should not discard its neighbours, and a
+/// skipped line only makes this replica more permissive for that key by one report.
+pub fn decode_report(
+    report: PeerReport,
+    own_replica_id: &str,
+    max_keys: usize,
+) -> Result<Vec<(KeyHash, PeerAdmissions)>, ReportError> {
+    if report.replica_id.is_empty() || report.replica_id.len() > MAX_REPLICA_ID_LENGTH {
+        return Err(ReportError::InvalidReplicaId);
+    }
+    if report.keys.len() > max_keys {
+        return Err(ReportError::TooManyKeys(report.keys.len()));
+    }
+    if report.replica_id == own_replica_id {
+        return Ok(Vec::new());
     }
 
-    /// Records a report, ignoring this replica's own echo.
-    ///
-    /// A replica may publish to itself — one loopback request per interval is cheaper than
-    /// the machinery to avoid it — and recognises the echo by its own id.
-    pub fn record(&self, own_replica_id: &str, report: PeerReport, received_at: Instant) {
-        if report.replica_id == own_replica_id {
-            return;
-        }
-
-        let keys = report
-            .keys
-            .iter()
-            .filter_map(|(hex, count)| KeyHash::from_hex(hex).map(|key| (key, *count)))
-            .collect();
-
-        self.reports
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(report.replica_id, StoredReport { received_at, keys });
-    }
-
-    /// Tokens every fresh peer reports having taken for `key`.
-    ///
-    /// A peer that has stopped reporting ages out of the window and stops counting, which
-    /// is what makes a lost peer degrade into "this replica counts alone" rather than into
-    /// a wrong answer.
-    pub fn consumed_for(&self, key: KeyHash, now: Instant) -> u32 {
-        let reports = self.reports.read().unwrap_or_else(|p| p.into_inner());
-
-        reports
-            .values()
-            .filter(|report| now.duration_since(report.received_at) < self.staleness_limit)
-            .filter_map(|report| report.keys.get(&key))
-            .sum()
-    }
-
-    /// Drops peers that have not reported within the window.
-    pub fn evict_stale(&self, now: Instant) {
-        self.reports
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|_, report| now.duration_since(report.received_at) < self.staleness_limit);
-    }
-
-    /// How many peers are currently counted.
-    pub fn fresh_peer_count(&self, now: Instant) -> usize {
-        self.reports
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .filter(|report| now.duration_since(report.received_at) < self.staleness_limit)
-            .count()
-    }
+    Ok(report
+        .keys
+        .iter()
+        .filter_map(|line| {
+            let key = KeyHash::from_hex(&line.key)?;
+            let usable = line.admitted > 0
+                && line.last.is_finite()
+                && line.limit.is_finite()
+                && line.limit > 0.0
+                && line.burst.is_finite();
+            usable.then_some((
+                key,
+                PeerAdmissions {
+                    admitted: line.admitted,
+                    last: line.last,
+                    limit: line.limit,
+                    burst: line.burst,
+                    ttl: Duration::from_millis(line.ttl_ms).min(MAX_REPORTED_TTL),
+                },
+            ))
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const WINDOW: Duration = Duration::from_millis(1000);
+    const LIMIT: f64 = 3.0 / 1_000_000.0;
 
-    fn report_of(replica: &str, key: KeyHash, count: u32) -> PeerReport {
+    fn line(key: KeyHash, admitted: u32) -> KeyAdmissions {
+        KeyAdmissions {
+            key: key.to_hex(),
+            admitted,
+            last: 1_787_000_000_000_000.0,
+            limit: LIMIT,
+            burst: 10.0,
+            ttl_ms: 2_000,
+        }
+    }
+
+    fn report_of(replica: &str, lines: Vec<KeyAdmissions>) -> PeerReport {
         PeerReport {
             replica_id: replica.to_string(),
-            keys: HashMap::from([(key.to_hex(), count)]),
+            keys: lines,
         }
     }
 
     #[test]
-    fn counts_from_several_peers_add_up() {
-        let now = Instant::now();
-        let table = PeerTable::new(WINDOW);
+    fn a_report_decodes_into_admissions_to_fold() {
         let key = KeyHash::from_key(b"rate:mw:client");
 
-        table.record("self", report_of("peer-a", key, 5), now);
-        table.record("self", report_of("peer-b", key, 3), now);
+        let decoded = decode_report(report_of("peer-a", vec![line(key, 5)]), "self", 100).unwrap();
 
-        assert_eq!(table.consumed_for(key, now), 8);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, key);
+        assert_eq!(decoded[0].1.admitted, 5);
+        assert_eq!(decoded[0].1.limit, LIMIT);
+        assert_eq!(decoded[0].1.burst, 10.0);
+        assert_eq!(decoded[0].1.ttl, Duration::from_secs(2));
     }
 
     #[test]
     fn a_replicas_own_echo_is_discarded() {
-        let now = Instant::now();
-        let table = PeerTable::new(WINDOW);
         let key = KeyHash::from_key(b"rate:mw:client");
 
-        table.record("self", report_of("self", key, 9), now);
+        let decoded = decode_report(report_of("self", vec![line(key, 9)]), "self", 100).unwrap();
 
-        assert_eq!(table.consumed_for(key, now), 0);
-        assert_eq!(table.fresh_peer_count(now), 0);
+        assert!(decoded.is_empty());
     }
 
     #[test]
-    fn a_newer_report_replaces_the_previous_one_from_that_peer() {
-        let now = Instant::now();
-        let table = PeerTable::new(WINDOW);
+    fn an_oversized_report_is_refused() {
         let key = KeyHash::from_key(b"rate:mw:client");
-
-        table.record("self", report_of("peer-a", key, 5), now);
-        table.record("self", report_of("peer-a", key, 2), now);
-
-        // Replaced, not accumulated: each report is that peer's whole current view.
-        assert_eq!(table.consumed_for(key, now), 2);
-    }
-
-    #[test]
-    fn a_silent_peer_stops_counting() {
-        let start = Instant::now();
-        let table = PeerTable::new(WINDOW);
-        let key = KeyHash::from_key(b"rate:mw:client");
-
-        table.record("self", report_of("peer-a", key, 5), start);
+        let lines = (0..3).map(|_| line(key, 1)).collect();
 
         assert_eq!(
-            table.consumed_for(key, start + Duration::from_millis(500)),
-            5
-        );
-        assert_eq!(
-            table.consumed_for(key, start + Duration::from_millis(1500)),
-            0
+            decode_report(report_of("peer-a", lines), "self", 2),
+            Err(ReportError::TooManyKeys(3))
         );
     }
 
     #[test]
-    fn an_unreported_key_counts_as_zero() {
-        let now = Instant::now();
-        let table = PeerTable::new(WINDOW);
+    fn an_implausible_replica_id_is_refused() {
+        assert_eq!(
+            decode_report(report_of("", vec![]), "self", 100),
+            Err(ReportError::InvalidReplicaId)
+        );
+        assert_eq!(
+            decode_report(report_of(&"x".repeat(300), vec![]), "self", 100),
+            Err(ReportError::InvalidReplicaId)
+        );
+    }
 
-        table.record(
+    #[test]
+    fn lines_that_cannot_be_folded_safely_are_skipped() {
+        let key = KeyHash::from_key(b"rate:mw:client");
+        let mut zero_limit = line(key, 1);
+        zero_limit.limit = 0.0;
+        let mut non_finite = line(key, 1);
+        non_finite.burst = f64::INFINITY;
+        let mut bad_key = line(key, 1);
+        bad_key.key = "not-hex".to_string();
+        let mut nothing_admitted = line(key, 0);
+        nothing_admitted.admitted = 0;
+
+        let decoded = decode_report(
+            report_of(
+                "peer-a",
+                vec![
+                    zero_limit,
+                    non_finite,
+                    bad_key,
+                    nothing_admitted,
+                    line(key, 2),
+                ],
+            ),
             "self",
-            report_of("peer-a", KeyHash::from_key(b"one"), 5),
-            now,
-        );
+            100,
+        )
+        .unwrap();
 
-        assert_eq!(table.consumed_for(KeyHash::from_key(b"other"), now), 0);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].1.admitted, 2);
     }
 
     #[test]
-    fn stale_peers_are_evicted() {
-        let start = Instant::now();
-        let table = PeerTable::new(WINDOW);
-        table.record(
-            "self",
-            report_of("peer-a", KeyHash::from_key(b"one"), 5),
-            start,
-        );
+    fn a_reported_lifetime_is_capped() {
+        let key = KeyHash::from_key(b"rate:mw:client");
+        let mut forever = line(key, 1);
+        forever.ttl_ms = u64::MAX;
 
-        table.evict_stale(start + Duration::from_millis(1500));
+        let decoded = decode_report(report_of("peer-a", vec![forever]), "self", 100).unwrap();
 
-        assert_eq!(
-            table.fresh_peer_count(start + Duration::from_millis(1500)),
-            0
-        );
+        assert_eq!(decoded[0].1.ttl, MAX_REPORTED_TTL);
     }
 
     #[test]
     fn a_report_survives_a_round_trip_through_json() {
         let key = KeyHash::from_key(b"rate:mw:client");
-        let report = report_of("peer-a", key, 7);
+        let report = report_of("peer-a", vec![line(key, 7)]);
 
         let decoded: PeerReport =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();

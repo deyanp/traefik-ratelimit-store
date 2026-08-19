@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::task::JoinSet;
+
 use traefik_ratelimit_store::app_env::AppEnv;
 use traefik_ratelimit_store::health::Health;
-use traefik_ratelimit_store::peers::PeerTable;
 use traefik_ratelimit_store::script::ScriptRegistry;
 use traefik_ratelimit_store::store::BucketStore;
 use traefik_ratelimit_store::{log_events, logging, mesh, server};
@@ -18,16 +19,12 @@ const DRAIN_PERIOD: Duration = Duration::from_secs(5);
 
 /// Reclaims expired entries on a timer, so memory is returned whether or not traffic
 /// keeps arriving. One task for the process, living as long as the store does.
-fn spawn_sweeper(store: Arc<BucketStore>) {
-    let interval = store.config().sweep_interval;
-
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        loop {
-            ticker.tick().await;
-            store.sweep_expired(Instant::now());
-        }
-    });
+async fn run_sweeper(store: Arc<BucketStore>) {
+    let mut ticker = tokio::time::interval(store.config().sweep_interval);
+    loop {
+        ticker.tick().await;
+        store.sweep_expired(Instant::now());
+    }
 }
 
 /// Turns a termination signal into an orderly withdrawal.
@@ -82,47 +79,46 @@ async fn main() {
     );
 
     let store = Arc::new(BucketStore::new(app_env.store));
-    let peers = Arc::new(PeerTable::new(app_env.peer_staleness_limit));
     let scripts = Arc::new(ScriptRegistry::new());
     let health = Arc::new(Health::new(app_env.listen_address.clone()));
 
-    spawn_sweeper(store.clone());
-    // Independent of the publisher, so the ring rotates even when this replica has no
-    // peers to publish to.
-    tokio::spawn(mesh::run_consumption_ticker(
-        store.clone(),
-        app_env.peer_publish_interval,
-    ));
     tokio::spawn(drain_on_termination(health.clone()));
 
-    // The peer endpoint and the publisher are only useful together, and a replica with
-    // neither is still correct — it simply counts alone.
-    let peer_endpoint = tokio::spawn({
-        let peers = peers.clone();
-        let replica_id = app_env.replica_id.clone();
+    // Every task here must run for the life of the process. They are supervised together:
+    // a sweeper that has died leaves memory to grow, a publisher that has died leaves the
+    // mesh silently counting alone, and neither shows in any probe — so the first one to
+    // stop, for any reason, ends the process and lets the orchestrator replace it.
+    let mut background = JoinSet::new();
+    background.spawn(run_sweeper(store.clone()));
+    background.spawn(mesh::run_publisher(store.clone(), app_env.clone()));
+    background.spawn({
+        let store = store.clone();
         let health = health.clone();
-        let secret = app_env.peer_shared_secret.clone();
-        let address = app_env.peer_listen_address.clone();
+        let app_env = app_env.clone();
         async move {
-            if let Err(error) =
-                mesh::run_peer_endpoint(peers, replica_id, health, secret, &address).await
-            {
+            if let Err(error) = mesh::run_peer_endpoint(store, health, &app_env).await {
                 tracing::error!(error = %error, "peer endpoint stopped");
             }
         }
     });
 
-    tokio::spawn(mesh::run_publisher(
-        store.clone(),
-        peers.clone(),
-        app_env.clone(),
-    ));
-
     // Serving the protocol is this process's whole job, so a failure here is fatal and
     // the orchestrator should replace the pod rather than leave it running dead.
-    if let Err(error) = server::run(store, peers, scripts, &app_env.listen_address).await {
-        tracing::error!(error = %error, "{} stopped", app_env.app_name);
-        peer_endpoint.abort();
-        std::process::exit(1);
+    tokio::select! {
+        served = server::run(store, scripts, &app_env.listen_address) => {
+            if let Err(error) = served {
+                tracing::error!(error = %error, "{} stopped", app_env.app_name);
+            }
+        }
+        stopped = background.join_next() => {
+            let (event_id, event_name) = log_events::BACKGROUND_TASK_STOPPED;
+            match stopped {
+                Some(Err(error)) => tracing::error!(event_id, event_name, error = %error, "a background task panicked"),
+                _ => tracing::error!(event_id, event_name, "a background task stopped"),
+            }
+        }
     }
+
+    background.abort_all();
+    std::process::exit(1);
 }

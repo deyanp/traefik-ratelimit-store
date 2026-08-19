@@ -18,13 +18,21 @@ use traefik_ratelimit_store::store::{BucketStore, KeyHash, StoreConfig};
 const REALISTIC_NOW: f64 = 1_787_000_000_000_000.0;
 const TTL: Duration = Duration::from_secs(600);
 
+/// Room for every key these measurements insert. The default ceiling is sized for tests;
+/// measuring against it would time the capacity trim rather than the operation.
+fn roomy_config() -> StoreConfig {
+    StoreConfig {
+        capacity_per_shard: 1 << 20,
+        ..StoreConfig::default()
+    }
+}
+
 fn params(now: f64) -> BucketParams {
     BucketParams {
         limit: 3.0 / 1_000_000.0,
         burst: 10.0,
         now,
         max_delay: 166_666.0,
-        peer_consumed: 0.0,
     }
 }
 
@@ -59,7 +67,7 @@ fn measure_apply_request_wide(store: &BucketStore, start: Instant) {
 
 /// The timer-driven reclaim, over a store holding a realistic resident set.
 fn measure_sweep(start: Instant) {
-    let store = BucketStore::new(StoreConfig::default());
+    let store = BucketStore::new(roomy_config());
     let count = 200_000;
     for index in 0..count {
         store.apply_request(
@@ -118,7 +126,7 @@ fn measure_capacity_trim(start: Instant) {
 
 fn main() {
     let start = Instant::now();
-    let store = BucketStore::new(StoreConfig::default());
+    let store = BucketStore::new(roomy_config());
 
     measure_apply_request(&store, start);
     measure_apply_request_wide(&store, start);

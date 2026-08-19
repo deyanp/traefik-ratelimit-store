@@ -1,30 +1,32 @@
 //! Mesh accuracy, driven through the production path.
 //!
-//! Replicas are real `BucketStore` and `PeerTable` instances, and a broadcast is the same
-//! `collect_consumption` → `PeerReport::new` → `record` sequence the publisher performs.
-//! Only the HTTP transport is left out, which is the one seam a test is entitled to
-//! replace — everything that decides an outcome is production code.
+//! Replicas are real `BucketStore` instances, and an exchange is the same
+//! `collect_report` → `PeerReport::new` → `decode_report` → `apply_peer_admissions`
+//! sequence the publisher and the peer endpoint perform. Only the HTTP transport is left
+//! out, which is the one seam a test is entitled to replace — everything that decides an
+//! outcome is production code.
 
 use std::time::{Duration, Instant};
 
 use cucumber::{given, then, when};
 
 use traefik_ratelimit_store::bucket::BucketParams;
-use traefik_ratelimit_store::peers::{PeerReport, PeerTable};
+use traefik_ratelimit_store::peers::{PeerReport, decode_report};
 use traefik_ratelimit_store::store::{BucketStore, KeyHash, StoreConfig};
 
-/// Every request in a scenario carries the same timestamp, so no refill occurs and the
-/// budget under test is exactly the configured burst.
-const FROZEN_NOW: f64 = 1_787_000_000_000_000.0;
+/// The caller's clock at the start of every scenario, in microseconds. Scenarios that
+/// freeze time send exactly this with every request, so no refill occurs and the budget
+/// under test is exactly the configured burst.
+const START: f64 = 1_787_000_000_000_000.0;
 
 /// The key every request in a scenario competes for.
 const CLIENT_KEY: &[u8] = b"rate:mw-shared:203.0.113.9";
 
-const TTL: Duration = Duration::from_secs(60);
+const TTL: Duration = Duration::from_secs(600);
 
-/// How often replicas broadcast, in requests served by a single replica.
+/// How often replicas exchange, in requests served by a single replica.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Broadcast {
+enum Exchange {
     Never,
     EveryRequests(usize),
 }
@@ -32,7 +34,6 @@ enum Broadcast {
 struct Replica {
     id: String,
     store: BucketStore,
-    peers: PeerTable,
 }
 
 #[derive(cucumber::World)]
@@ -42,9 +43,7 @@ pub struct World {
     burst: f64,
     max_delay: f64,
     replicas: Vec<Replica>,
-    broadcast: Broadcast,
-    /// Age applied to peer reports, so a scenario can make peers look silent.
-    peer_silence: Duration,
+    exchange: Exchange,
     admitted: usize,
 }
 
@@ -52,7 +51,7 @@ impl std::fmt::Debug for World {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("World")
             .field("replicas", &self.replicas.len())
-            .field("broadcast", &self.broadcast)
+            .field("exchange", &self.exchange)
             .field("admitted", &self.admitted)
             .finish()
     }
@@ -65,33 +64,63 @@ impl World {
             burst: 0.0,
             max_delay: 0.0,
             replicas: Vec::new(),
-            broadcast: Broadcast::EveryRequests(1),
-            peer_silence: Duration::ZERO,
+            exchange: Exchange::EveryRequests(1),
             admitted: 0,
         }
     }
 
-    fn params(&self) -> BucketParams {
+    fn params_at(&self, now: f64) -> BucketParams {
         BucketParams {
             limit: self.rate_per_second / 1_000_000.0,
             burst: self.burst,
-            now: FROZEN_NOW,
+            now,
             max_delay: self.max_delay,
-            peer_consumed: 0.0,
         }
     }
 
-    /// One replica tells every other what it has consumed, exactly as the publisher does.
-    fn broadcast_from(&self, index: usize, at: Instant) {
+    /// One replica tells every other what it admitted, exactly as the publisher and the
+    /// peer endpoint do between them.
+    fn exchange_from(&self, index: usize, at: Instant) {
         let source = &self.replicas[index];
         let report = PeerReport::new(
             source.id.clone(),
-            &source.store.collect_consumption(usize::MAX),
+            &source.store.collect_report(usize::MAX, at),
         );
 
         for (other, replica) in self.replicas.iter().enumerate() {
-            if other != index {
-                replica.peers.record(&replica.id, report.clone(), at);
+            if other == index {
+                continue;
+            }
+            let admissions = decode_report(report.clone(), &replica.id, usize::MAX)
+                .expect("a report built by the store must decode");
+            for (key, peer) in admissions {
+                replica.store.apply_peer_admissions(key, peer, at);
+            }
+        }
+    }
+
+    /// Drives `requests` — each `(caller time, replica index)` — through the replicas,
+    /// exchanging as the scenario configured.
+    fn drive(&mut self, requests: impl Iterator<Item = (f64, usize)>) {
+        let key = KeyHash::from_key(CLIENT_KEY);
+        let at = Instant::now();
+        let mut served_by_replica = vec![0usize; self.replicas.len()];
+
+        for (now, index) in requests {
+            let params = self.params_at(now);
+            let outcome = self.replicas[index]
+                .store
+                .apply_request(key, &params, TTL, at);
+
+            if outcome.wait <= params.max_delay {
+                self.admitted += 1;
+            }
+
+            served_by_replica[index] += 1;
+            if let Exchange::EveryRequests(every) = self.exchange
+                && served_by_replica[index].is_multiple_of(every)
+            {
+                self.exchange_from(index, at);
             }
         }
     }
@@ -111,79 +140,71 @@ async fn given_rate_limit(world: &mut World, average: f64, period: f64, burst: f
 
 #[given(regex = r"^(\d+) replicas?$")]
 async fn given_replicas(world: &mut World, count: usize) {
-    // Generous, so a peer only ages out when a scenario says it should.
-    let staleness_limit = Duration::from_secs(2);
-
     world.replicas = (0..count)
         .map(|index| Replica {
             id: format!("replica-{index}"),
             store: BucketStore::new(StoreConfig::default()),
-            peers: PeerTable::new(staleness_limit),
         })
         .collect();
 }
 
 #[given("counters are exchanged after every request")]
-async fn given_broadcast_every_request(world: &mut World) {
-    world.broadcast = Broadcast::EveryRequests(1);
+async fn given_exchange_every_request(world: &mut World) {
+    world.exchange = Exchange::EveryRequests(1);
 }
 
 #[given(regex = r"^counters are exchanged after every (\d+) requests$")]
-async fn given_broadcast_every_n(world: &mut World, every: usize) {
-    world.broadcast = Broadcast::EveryRequests(every);
+async fn given_exchange_every_n(world: &mut World, every: usize) {
+    world.exchange = Exchange::EveryRequests(every);
 }
 
 #[given("counters are never exchanged")]
-async fn given_no_broadcast(world: &mut World) {
-    world.broadcast = Broadcast::Never;
+async fn given_no_exchange(world: &mut World) {
+    world.exchange = Exchange::Never;
 }
 
-#[given(regex = r"^the peers have been silent for (\d+) seconds$")]
-async fn given_peers_silent(world: &mut World, seconds: u64) {
-    world.peer_silence = Duration::from_secs(seconds);
-}
-
-#[when(regex = r"^(\d+) requests for the same client arrive$")]
-async fn when_requests_arrive(world: &mut World, count: usize) {
-    let key = KeyHash::from_key(CLIENT_KEY);
-    let params = world.params();
-    let now = Instant::now();
+#[when(regex = r"^(\d+) requests for the same client arrive at once$")]
+async fn when_requests_arrive_at_once(world: &mut World, count: usize) {
     let replica_count = world.replicas.len();
-    let mut served_by_replica = vec![0usize; replica_count];
+    // Round robin, which is what a load balancer spreading connections produces. Time
+    // is frozen, so the only budget is the burst.
+    world.drive((0..count).map(|request| (START, request % replica_count)));
+}
 
-    for request in 0..count {
-        // Round robin, which is what a load balancer spreading connections produces.
-        let index = request % replica_count;
+#[when(regex = r"^(\d+) requests per second for the same client arrive for (\d+) seconds$")]
+async fn when_sustained_spread(world: &mut World, per_second: usize, seconds: usize) {
+    let replica_count = world.replicas.len();
+    let step = 1_000_000.0 / per_second as f64;
+    world.drive(
+        (0..per_second * seconds)
+            .map(|request| (START + request as f64 * step, request % replica_count)),
+    );
+}
 
-        let peer_consumed = {
-            let replica = &world.replicas[index];
-            // Reports are read at a moment shifted by the scenario's silence, so a scenario
-            // can age its peers out without waiting.
-            f64::from(replica.peers.consumed_for(key, now + world.peer_silence))
-        };
+#[when(
+    regex = r"^(\d+) requests per second for the same client arrive for (\d+) seconds, all at one replica$"
+)]
+async fn when_sustained_concentrated(world: &mut World, per_second: usize, seconds: usize) {
+    let step = 1_000_000.0 / per_second as f64;
+    world.drive((0..per_second * seconds).map(|request| (START + request as f64 * step, 0)));
+}
 
-        let outcome = world.replicas[index].store.apply_request(
-            key,
-            &BucketParams {
-                peer_consumed,
-                ..params
-            },
-            TTL,
-            now,
-        );
-
-        if outcome.wait <= params.max_delay {
-            world.admitted += 1;
-        }
-
-        served_by_replica[index] += 1;
-
-        if let Broadcast::EveryRequests(every) = world.broadcast
-            && served_by_replica[index].is_multiple_of(every)
-        {
-            world.broadcast_from(index, now);
-        }
-    }
+#[when(
+    regex = r"^(\d+) requests per second for the same client arrive for (\d+) seconds, moving to the next replica every (\d+) seconds$"
+)]
+async fn when_sustained_shifting(
+    world: &mut World,
+    per_second: usize,
+    seconds: usize,
+    move_every: usize,
+) {
+    let replica_count = world.replicas.len();
+    let step = 1_000_000.0 / per_second as f64;
+    world.drive((0..per_second * seconds).map(|request| {
+        let elapsed = request as f64 * step;
+        let replica = (elapsed / (move_every as f64 * 1_000_000.0)) as usize % replica_count;
+        (START + elapsed, replica)
+    }));
 }
 
 #[then(regex = r"^(\d+) requests are admitted$")]

@@ -202,9 +202,6 @@ mod tests {
             burst,
             now,
             max_delay,
-            // The reference knows nothing of peers, so the differential is scoped to a
-            // single replica. Mesh accuracy is a separate, statistical property.
-            peer_consumed: 0.0,
         }
     }
 

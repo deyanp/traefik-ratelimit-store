@@ -98,16 +98,16 @@ spec:
               value: "0.0.0.0:6379"
             - name: PEER_LISTEN_ADDRESS
               value: "0.0.0.0:8080"
-            # Resolves to every ready pod, which is the entire discovery mechanism.
+            # Resolves to every ready pod, which is the entire discovery mechanism. The
+            # trailing dot makes the name absolute, so the resolver asks once instead of
+            # walking the pod's search list first — the name is re-resolved every interval.
             - name: PEER_ENDPOINT
-              value: "traefik-ratelimit-store-peers.default.svc.cluster.local:8080"
+              value: "traefik-ratelimit-store-peers.default.svc.cluster.local.:8080"
             - name: PEER_PUBLISH_INTERVAL_MS
               value: "150"
-            - name: PEER_STALENESS_LIMIT_MS
-              value: "1000"
             # Without this the replicas refuse to start, deliberately. An unauthenticated
-            # peer endpoint lets anyone erase a peer's consumption and lift the limit, so
-            # the choice has to be made rather than defaulted into.
+            # peer endpoint lets anyone refill or drain any bucket on any replica, so the
+            # choice has to be made rather than defaulted into.
             #
             #   kubectl create secret generic traefik-ratelimit-store \
             #       --from-literal=peer-shared-secret="$(openssl rand -hex 32)"
@@ -167,3 +167,39 @@ spec:
   selector:
     matchLabels:
       app: traefik-ratelimit-store
+
+---
+# Who may talk to the store. The protocol port accepts AUTH unconditionally — it trusts the
+# network — so without this anything in the cluster can drive any bucket; the peer port is
+# authenticated but still has no business being reachable from anywhere but the replicas.
+# Adjust the Traefik selector to the labels your Traefik pods carry. Note that the CNI must
+# enforce NetworkPolicy for this to hold: flannel (k3s, k3d) does not.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traefik-ratelimit-store
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: traefik-ratelimit-store
+  policyTypes: ["Ingress"]
+  ingress:
+    # The protocol port: Traefik, and nothing else.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: traefik
+      ports:
+        - protocol: TCP
+          port: 6379
+    # The peer port: the replicas themselves. The kubelet's probes originate from the node
+    # and are not subject to ingress policy on most CNIs; if yours blocks them, add the
+    # node CIDR here.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: traefik-ratelimit-store
+      ports:
+        - protocol: TCP
+          port: 8080

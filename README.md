@@ -54,22 +54,38 @@ the one thing the check exists to catch.
 
 ## How replicas share counters
 
-Replicas broadcast **consumption**, not bucket state. Bucket state does not merge: taking
-the newest or largest of two `(last, tokens)` pairs discards one replica's increments,
-which is the over-admission the sharing exists to prevent. Counts add, so they merge.
+Replicas share **admissions**, not bucket state. Bucket state does not merge: taking the
+newest or largest of two `(last, tokens)` pairs discards one replica's increments, which is
+the over-admission the sharing exists to prevent. An admission is a token taken from the
+one logical bucket, so a peer can debit it from its own copy exactly as if the request had
+arrived there.
 
 Every replica sends its own report to every peer each interval — a full mesh, not a gossip
 protocol. At a handful of replicas that is simpler and one hop rather than several rounds.
-Because a replica only ever publishes its own consumption, each entry in the peer table has
-exactly one author, so arriving reports overwrite rather than combine and there is no merge
-logic at all.
+A report carries, per key, what this replica admitted *since its last report*, when, and
+the `limit`/`burst` the caller sent, so the receiver folds it into its bucket as of that
+moment — refill up to then, subtract, done. Applying a report once is the whole protocol:
+there is no table to reconcile, no merge, and nothing to age out.
 
-A peer that stops reporting ages out of the staleness window and stops counting, so losing
-one degrades to "count alone" rather than to a wrong answer.
+Debiting the stored level — rather than offsetting each later decision by what peers
+reported recently — is what makes the limit hold under **sustained** traffic, not only
+across a burst. A decision-time offset leaves every replica refilling its own bucket at the
+full configured rate, and once each level sits at the raised threshold, every refilled
+token is spent locally: the deployment admits N times the rate while looking correct for
+the first burst. The cucumber suite pins both regimes.
 
-**Accuracy.** Overshoot is bounded by `(N−1) × rate × interval`. At three replicas, three
-requests per second and a 150ms interval that is under one request. The bound scales with
-the configured rate, so a high-rate middleware needs a shorter interval.
+A peer that stops reporting costs nothing but its own future admissions: what it debited
+before stays debited, and what it admits from then on is unknown until it reports again.
+Losing one degrades to "count alone for that peer" rather than to a wrong answer.
+
+**Accuracy.** Under sustained traffic the deployment admits the configured rate, however
+the traffic is spread: `tests/mesh_accuracy.feature` drives 20 requests per second for 60
+seconds at `30 per 10s, burst 10` across three replicas and admits 190–192 (burst plus
+rate × time is 190), whether the traffic is spread evenly, concentrated on one replica, or
+moves between them. A burst arriving faster than one exchange interval can be admitted up
+to once per replica before the first reports land, so the instantaneous overshoot is bounded
+by `(N−1) × burst` per key, and at steady state by `(N−1) × rate × interval` — under one
+request at three replicas, three per second and 150ms.
 
 ## Configuration
 
@@ -80,10 +96,9 @@ Everything has a working default; nothing is required.
 | `LISTEN_ADDRESS` | `0.0.0.0:6379` | Where the protocol listener binds |
 | `PEER_LISTEN_ADDRESS` | `0.0.0.0:8080` | Where the peer endpoint binds |
 | `PEER_ENDPOINT` | *(empty)* | DNS name resolving to all peers, or a comma-separated list. Empty means this replica counts alone |
-| `PEER_PUBLISH_INTERVAL_MS` | `150` | How often consumption is published to peers |
-| `PEER_STALENESS_LIMIT_MS` | `1000` | How long a peer's report stays usable |
-| `PEER_REQUEST_TIMEOUT_MS` | `50` | How long a single delivery may take before it is abandoned |
-| `PEER_MAX_KEYS_PER_REPORT` | `10000` | Most keys a report carries, busiest first |
+| `PEER_PUBLISH_INTERVAL_MS` | `150` | How often admissions are published to peers |
+| `PEER_REQUEST_TIMEOUT_MS` | `50` | How long a single delivery may take before it is abandoned. Must be shorter than the interval |
+| `PEER_MAX_KEYS_PER_REPORT` | `10000` | Most keys a report carries, busiest first; also the most accepted in one inbound report |
 | `PEER_SHARED_SECRET` | *(empty)* | Bearer token peers must present. Required once `PEER_ENDPOINT` is set |
 | `PEER_ALLOW_UNAUTHENTICATED` | `false` | Accept an unauthenticated peer endpoint deliberately |
 | `STORE_MEMORY_BUDGET_MB` | *(the cgroup limit)* | Budget the entry ceiling is derived from |
@@ -94,6 +109,11 @@ Everything has a working default; nothing is required.
 
 Nothing here is Kubernetes-specific: peer discovery is a DNS name or a static list, and the
 replica identity is a string. Under Kubernetes that DNS name is a headless Service.
+
+A zero interval, shard count, ceiling or report cap, a delivery timeout at or beyond the
+publish interval, or a malformed number anywhere **refuses to start** with a message naming
+the variable. Each of those used to fail later, inside a background task, where nothing
+would have noticed.
 
 ## Configuring Traefik against it
 
@@ -267,10 +287,10 @@ cannot infer from anything else: memory looks fine, latency looks fine, and quie
 sources are being admitted against fresh buckets.
 
 Peer reports are capped at the busiest `PEER_MAX_KEYS_PER_REPORT` keys, because a report
-carries one entry per active key and a wide keyspace would otherwise mean megabytes to
-every peer several times a second. Truncating by consumption is what makes the cap safe: a
-key taken once contributes one token to a peer's decision, so dropping it risks one extra
-admission, while the keys where sharing decides anything are the ones kept.
+carries one entry per key touched since the last one and a wide keyspace would otherwise
+mean megabytes to every peer several times a second. Nothing is lost by the cap: a key left
+out keeps its count and goes in a later report, so the cap only delays the keys where
+sharing decides the least.
 
 ## Security
 
@@ -279,25 +299,24 @@ The peer endpoint accepts a report from anyone the network allows unless
 required and the comparison is constant-time. Running without one logs
 `PeerEndpointUnauthenticated` at startup.
 
-**Set it.** An unauthenticated endpoint is a rate-limit bypass, not merely a nuisance.
-Reports are keyed by replica id and overwrite, so a stranger who reaches the endpoint and
-knows a replica's id — a pod name — can send an empty report in its name and erase that
-replica's consumption from every peer's view. Repeat for each replica and every one of them
-believes it is alone, which is N times the configured limit: exactly the failure this store
-exists to prevent.
-
-Demonstrated: a peer honestly reporting ten tokens taken produces a 333ms delay for the
-next request; a forged empty report in that peer's name drops it to zero.
+**Set it.** An unauthenticated endpoint is a rate-limit bypass, not merely a nuisance. A
+report is folded into this replica's buckets exactly like a peer's, so a stranger who
+reaches the endpoint can claim admissions for a key and throttle it, or claim a timestamp
+far in the future and refill a drained bucket. Do that to each replica and the limit is
+whatever the stranger says it is.
 
 A NetworkPolicy is the other half, not a substitute — k3s and k3d ship flannel, which does
 not enforce NetworkPolicy at all, and on managed clusters it holds only where the CNI
-enforces it.
+enforces it. The shipped manifest carries one: the protocol port admits only pods labelled
+as Traefik, the peer port only the store's own replicas (and the kubelet, for probes). The
+protocol port needs it most — `AUTH` is accepted unconditionally, so anything that can
+reach 6379 can drive any bucket.
 
 Neither default is safe, so there is no default. A replica with `PEER_ENDPOINT` set and no
 `PEER_SHARED_SECRET` **refuses to start**, naming both ways out. Requiring a secret that
 has not been configured would be no better than omitting one: every report would be
-rejected, every peer would age out, and the same N-times-looser limit would arrive by a
-different route. The only safe thing is to make the operator choose, so
+rejected, every replica would count alone, and the same N-times-looser limit would arrive
+by a different route. The only safe thing is to make the operator choose, so
 `PEER_ALLOW_UNAUTHENTICATED=true` records the decision in configuration rather than letting
 it happen by omission.
 
@@ -308,8 +327,10 @@ kubectl create secret generic traefik-ratelimit-store \
     --from-literal=peer-shared-secret="$(openssl rand -hex 32)"
 ```
 
-Request bodies are capped, the container runs as non-root on a read-only root filesystem
-with all capabilities dropped, and the image carries no shell.
+Request bodies are capped and authorisation is checked before a body is parsed; the script
+registry remembers at most sixteen unrecognised texts, so a stranger on the protocol port
+cannot grow the process one `EVAL` at a time; the container runs as non-root on a
+read-only root filesystem with all capabilities dropped, and the image carries no shell.
 
 ## Tests
 
@@ -357,9 +378,12 @@ PASSED: 3 replicas enforced one shared limit behind real Traefik
 The cluster is deleted afterwards and the kubectl context is never switched. Pass
 `--keepCluster true` to inspect it.
 
-**Alarm on three log events.** No metrics are implemented; the store emits structured logs
+**Alarm on these log events.** No metrics are implemented; the store emits structured logs
 and nothing else, which is the largest gap remaining before production. `ScriptDiverged`
 means a proxy upgrade changed the algorithm. `StoreAtCapacity` means keys are being shed.
+`PeerPublishRejected` means peers refuse this replica's reports — a secret that differs
+between replicas — and the mesh is silently counting alone. `BackgroundTaskStopped` means
+the sweeper, publisher or peer endpoint died and the process is exiting so it is replaced.
 `PeerEndpointUnauthenticated` means the mesh is writable by anything the network allows.
 
 **`conformance/soak.sh`** — sustained load with connection churn, watching for leaks. Every

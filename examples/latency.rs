@@ -90,7 +90,7 @@ async fn measure_connection(address: String, key: String, requests: usize) -> Ve
         .expect("write");
     read_reply(&mut stream, &mut buffer).await;
 
-    let digest = traefik_ratelimit_store::script::compute_digest(SCRIPT);
+    let digest = traefik_ratelimit_store::script::compute_digest(SCRIPT.as_bytes());
     let mut latencies = Vec::with_capacity(requests);
 
     for _ in 0..requests {

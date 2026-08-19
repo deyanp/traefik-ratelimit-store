@@ -7,8 +7,8 @@
 //! again — an idle store must shrink, not merely stop growing.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry as MapEntry;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
@@ -44,12 +44,6 @@ impl KeyHash {
     }
 }
 
-/// Slots in an entry's consumption ring.
-///
-/// The ring spans `SLOT_COUNT` publish intervals, which must cover the staleness window a
-/// peer applies to the report — otherwise a replica would under-report what it has taken.
-const SLOT_COUNT: usize = 8;
-
 /// How the store bounds itself.
 #[derive(Clone, Copy, Debug)]
 pub struct StoreConfig {
@@ -57,65 +51,63 @@ pub struct StoreConfig {
     pub shard_count: usize,
     /// Hard entry ceiling per shard. A backstop, not the mechanism.
     ///
-    /// Must be sized against the container's memory limit, and the two are easy to set
-    /// independently and get wrong: an entry costs around 390 bytes once the map has
-    /// grown, so a ceiling above the limit means the process is killed before the trim
-    /// that exists to prevent that ever runs. `shard_count * capacity_per_shard * 400`
-    /// bytes is the figure to compare, and connection buffers (~18KB each) come out of
-    /// the same budget.
+    /// Derived from the memory budget at startup (see `memory_budget`), because the
+    /// ceiling and the container's memory limit are one decision: an entry costs a few
+    /// hundred bytes once the map has grown, so a ceiling above the limit means the
+    /// process is killed before the trim that exists to prevent that ever runs.
     pub capacity_per_shard: usize,
     /// How often the background sweeper reclaims expired entries.
     pub sweep_interval: Duration,
 }
 
 impl Default for StoreConfig {
+    /// Sized for tests and examples. The binary derives `capacity_per_shard` from the
+    /// memory budget instead of taking this.
     fn default() -> Self {
         Self {
             shard_count: 16,
-            // 16 x 8192 entries at ~390 bytes is about 51MB, which leaves room for
-            // connection buffers inside the 128Mi the shipped manifest allows. Raising
-            // one of these without the other is how a store gets OOM-killed while its
-            // capacity backstop reports plenty of headroom.
             capacity_per_shard: 8_192,
             sweep_interval: Duration::from_secs(1),
         }
     }
 }
 
-/// One key's stored state, its lifetime, and what this replica has taken for it.
+/// One key's stored state, its lifetime, and what this replica still owes its peers.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     state: BucketState,
     expires_at: Instant,
-    /// Admissions per publish interval, oldest overwritten as the ring turns.
-    slots: [u32; SLOT_COUNT],
-    /// The tick the ring was last advanced to. Advancing is lazy, so an idle key costs
-    /// nothing until it is touched or collected.
-    slot_tick: u64,
+    /// The configuration the last request for this key carried. Sent with the next report
+    /// so a peer can fold this replica's admissions into its own bucket before it has
+    /// seen a request for the key itself. Never used for a local decision.
+    limit: f64,
+    burst: f64,
+    /// Admissions not yet reported to peers. Reset when a report carries them.
+    unpublished: u32,
 }
 
-impl Entry {
-    fn advance_ring(&mut self, tick: u64) {
-        let elapsed = tick.saturating_sub(self.slot_tick);
+/// This replica's admissions for one key since the last report, with what a peer needs
+/// to fold them into its own bucket.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeyReport {
+    pub key: KeyHash,
+    pub admitted: u32,
+    /// Timestamp of the last admission, in the caller's microseconds.
+    pub last: f64,
+    pub limit: f64,
+    pub burst: f64,
+    /// How long the entry has left to live here, so the peer's copy expires alongside it.
+    pub ttl: Duration,
+}
 
-        if elapsed >= SLOT_COUNT as u64 {
-            self.slots = [0; SLOT_COUNT];
-        } else {
-            for step in 1..=elapsed {
-                self.slots[((self.slot_tick + step) as usize) % SLOT_COUNT] = 0;
-            }
-        }
-
-        self.slot_tick = tick;
-    }
-
-    fn record_admission(&mut self, tick: u64) {
-        self.slots[(tick as usize) % SLOT_COUNT] += 1;
-    }
-
-    fn consumed_in_window(&self) -> u32 {
-        self.slots.iter().sum()
-    }
+/// Admissions a peer made for one key, as received.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PeerAdmissions {
+    pub admitted: u32,
+    pub last: f64,
+    pub limit: f64,
+    pub burst: f64,
+    pub ttl: Duration,
 }
 
 #[derive(Debug)]
@@ -156,6 +148,24 @@ impl Shard {
 
         self.entries.retain(|_, entry| entry.state.last > threshold);
     }
+
+    /// Makes room for one more key when the shard is at its ceiling.
+    ///
+    /// Expired entries go first; only if that frees nothing does the trim run. Returns
+    /// whether the trim ran, so the caller can report it.
+    fn make_room(&mut self, capacity: usize, now: Instant) -> bool {
+        if self.entries.len() < capacity {
+            return false;
+        }
+
+        self.sweep_expired(now);
+        if self.entries.len() < capacity {
+            return false;
+        }
+
+        self.trim_least_recently_active();
+        true
+    }
 }
 
 /// The store the connection handlers share.
@@ -163,8 +173,6 @@ impl Shard {
 pub struct BucketStore {
     shards: Vec<Mutex<Shard>>,
     config: StoreConfig,
-    /// Advanced once per publish interval; drives every entry's consumption ring.
-    tick: AtomicU64,
 }
 
 impl BucketStore {
@@ -177,15 +185,33 @@ impl BucketStore {
             })
             .collect();
 
-        Self {
-            shards,
-            config,
-            tick: AtomicU64::new(0),
-        }
+        Self { shards, config }
     }
 
     pub fn config(&self) -> StoreConfig {
         self.config
+    }
+
+    fn lock_shard(&self, key: KeyHash) -> std::sync::MutexGuard<'_, Shard> {
+        self.shards[key.shard_index(self.config.shard_count)]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn warn_at_capacity(&self, remaining: usize) {
+        // The one condition an operator cannot infer from anything else. Distinct keys are
+        // arriving faster than they expire, so the store is shedding the least recently
+        // active — which means some sources are being admitted against a fresh bucket. It
+        // is naturally throttled: a trim frees a tenth of a shard, so this cannot fire
+        // again until that tenth is refilled.
+        let (event_id, event_name) = crate::log_events::STORE_AT_CAPACITY;
+        tracing::warn!(
+            event_id,
+            event_name,
+            ceiling = self.config.capacity_per_shard,
+            remaining,
+            "shard at capacity; shedding least recently active keys"
+        );
     }
 
     /// Applies one request to `key`, atomically, and stores the result.
@@ -200,19 +226,21 @@ impl BucketStore {
         ttl: Duration,
         now: Instant,
     ) -> BucketOutcome {
-        let tick = self.tick.load(Ordering::Relaxed);
-        let shard = &self.shards[key.shard_index(self.config.shard_count)];
-        let mut shard = shard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut shard = self.lock_shard(key);
 
-        // An entry the sweeper has not reached yet must still read as absent.
-        let existing = shard
-            .entries
-            .get(&key)
-            .filter(|entry| entry.expires_at > now)
-            .copied();
-        let previous = existing.map(|entry| entry.state);
+        // One probe for the common case. The ceiling is checked only for a key the shard
+        // does not hold, which is the only insert that can grow it.
+        let (previous, unpublished) = match shard.entries.get(&key) {
+            // An entry the sweeper has not reached yet must still read as absent.
+            Some(entry) if entry.expires_at > now => (Some(entry.state), entry.unpublished),
+            Some(_) => (None, 0),
+            None => {
+                if shard.make_room(self.config.capacity_per_shard, now) {
+                    self.warn_at_capacity(shard.entries.len());
+                }
+                (None, 0)
+            }
+        };
 
         let outcome = bucket::apply_request(previous, params);
 
@@ -220,66 +248,96 @@ impl BucketStore {
         // caller consumed nothing — so only an admission counts toward what peers are told.
         let admitted = outcome.wait <= params.max_delay;
 
-        let (slots, slot_tick) = existing
-            .map(|entry| (entry.slots, entry.slot_tick))
-            .unwrap_or(([0; SLOT_COUNT], tick));
-        let mut carried = Entry {
-            state: outcome.state,
-            expires_at: now + ttl,
-            slots,
-            slot_tick,
-        };
-        carried.advance_ring(tick);
-        if admitted {
-            carried.record_admission(tick);
-        }
-
-        if !shard.entries.contains_key(&key)
-            && shard.entries.len() >= self.config.capacity_per_shard
-        {
-            shard.sweep_expired(now);
-            if shard.entries.len() >= self.config.capacity_per_shard {
-                shard.trim_least_recently_active();
-
-                // The one condition an operator cannot infer from anything else. Distinct
-                // keys are arriving faster than they expire, so the store is shedding the
-                // least recently active — which means some sources are being admitted
-                // against a fresh bucket. It is naturally throttled: a trim frees a tenth
-                // of a shard, so this cannot fire again until that tenth is refilled.
-                let (event_id, event_name) = crate::log_events::STORE_AT_CAPACITY;
-                tracing::warn!(
-                    event_id,
-                    event_name,
-                    ceiling = self.config.capacity_per_shard,
-                    remaining = shard.entries.len(),
-                    "shard at capacity; shedding least recently active keys"
-                );
-            }
-        }
-
-        shard.entries.insert(key, carried);
+        shard.entries.insert(
+            key,
+            Entry {
+                state: outcome.state,
+                expires_at: now + ttl,
+                limit: params.limit,
+                burst: params.burst,
+                unpublished: unpublished.saturating_add(u32::from(admitted)),
+            },
+        );
 
         outcome
     }
 
-    /// Advances the consumption ring by one publish interval and returns the tick used.
-    pub fn advance_tick(&self) -> u64 {
-        self.tick.fetch_add(1, Ordering::Relaxed) + 1
+    /// Folds admissions a peer reports for `key` into this replica's own bucket.
+    ///
+    /// Applied once, at receipt, as a debit at the moment the peer says they happened.
+    /// Nothing is remembered about the peer afterwards: the level now simply reflects
+    /// those admissions, exactly as it would had they been made here.
+    pub fn apply_peer_admissions(&self, key: KeyHash, peer: PeerAdmissions, now: Instant) {
+        let mut shard = self.lock_shard(key);
+
+        let live = shard
+            .entries
+            .get(&key)
+            .filter(|entry| entry.expires_at > now)
+            .copied();
+
+        if live.is_none() && shard.make_room(self.config.capacity_per_shard, now) {
+            self.warn_at_capacity(shard.entries.len());
+        }
+
+        // A key this replica has seen is folded with the configuration it saw itself; the
+        // peer's copy is needed only for a key it has not.
+        let (limit, burst) = match live {
+            Some(entry) => (entry.limit, entry.burst),
+            None => (peer.limit, peer.burst),
+        };
+        let state = bucket::apply_peer_admissions(
+            live.map(|entry| entry.state),
+            f64::from(peer.admitted),
+            peer.last,
+            limit,
+            burst,
+        );
+
+        let expires_at = match live {
+            Some(entry) => entry.expires_at.max(now + peer.ttl),
+            None => now + peer.ttl,
+        };
+
+        match shard.entries.entry(key) {
+            MapEntry::Occupied(mut occupied) if live.is_some() => {
+                let entry = occupied.get_mut();
+                entry.state = state;
+                entry.expires_at = expires_at;
+            }
+            MapEntry::Occupied(mut occupied) => {
+                occupied.insert(Entry {
+                    state,
+                    expires_at,
+                    limit: peer.limit,
+                    burst: peer.burst,
+                    unpublished: 0,
+                });
+            }
+            MapEntry::Vacant(vacant) => {
+                vacant.insert(Entry {
+                    state,
+                    expires_at,
+                    limit: peer.limit,
+                    burst: peer.burst,
+                    unpublished: 0,
+                });
+            }
+        }
     }
 
-    /// What this replica has taken, per key, within the trailing window.
+    /// What this replica has admitted since the last report, per key, and marks it sent.
     ///
-    /// Walks every shard once, which is the same walk the publish loop needs anyway.
+    /// Each shard is locked once, for a read and a reset per entry; the selection below
+    /// runs with no lock held.
     ///
-    /// Truncated to the `limit` busiest keys. A report carries one entry per active key,
-    /// so a wide keyspace would otherwise produce a body of several megabytes to every
-    /// peer several times a second. Truncating by consumption rather than arbitrarily is
-    /// what makes the cap safe: a key this replica has taken one token for contributes one
-    /// token to a peer's decision, so dropping it risks one extra admission, while the
-    /// keys where sharing actually decides anything are the ones kept.
-    pub fn collect_consumption(&self, limit: usize) -> HashMap<KeyHash, u32> {
-        let tick = self.tick.load(Ordering::Relaxed);
-        let mut consumption: HashMap<KeyHash, u32> = HashMap::new();
+    /// Truncated to the `limit` keys with the most unreported admissions. A report carries
+    /// one entry per key touched since the last one, so a wide keyspace would otherwise
+    /// produce a body of several megabytes to every peer several times a second. Nothing is
+    /// lost by the cap: a key left out keeps its count and goes in a later report, so the
+    /// cap only delays the keys where sharing decides the least.
+    pub fn collect_report(&self, limit: usize, now: Instant) -> Vec<KeyReport> {
+        let mut report = Vec::new();
 
         for shard in &self.shards {
             let mut shard = shard
@@ -287,23 +345,34 @@ impl BucketStore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             for (key, entry) in shard.entries.iter_mut() {
-                entry.advance_ring(tick);
-                let consumed = entry.consumed_in_window();
-                if consumed > 0 {
-                    consumption.insert(*key, consumed);
+                if entry.unpublished == 0 || entry.expires_at <= now {
+                    continue;
+                }
+                report.push(KeyReport {
+                    key: *key,
+                    admitted: entry.unpublished,
+                    last: entry.state.last,
+                    limit: entry.limit,
+                    burst: entry.burst,
+                    ttl: entry.expires_at - now,
+                });
+                entry.unpublished = 0;
+            }
+        }
+
+        if report.len() > limit {
+            // Keep the busiest; hand the rest their counts back for a later report.
+            report.select_nth_unstable_by(limit.saturating_sub(1), |left, right| {
+                right.admitted.cmp(&left.admitted)
+            });
+            for deferred in report.drain(limit..) {
+                if let Some(entry) = self.lock_shard(deferred.key).entries.get_mut(&deferred.key) {
+                    entry.unpublished = entry.unpublished.saturating_add(deferred.admitted);
                 }
             }
         }
 
-        if consumption.len() > limit {
-            let mut counts: Vec<u32> = consumption.values().copied().collect();
-            let cut_index = consumption.len() - limit;
-            let (_, cut, _) = counts.select_nth_unstable(cut_index);
-            let threshold = *cut;
-            consumption.retain(|_, consumed| *consumed > threshold);
-        }
-
-        consumption
+        report
     }
 
     /// Reclaims expired entries across every shard.
@@ -353,7 +422,6 @@ mod tests {
             burst: BURST,
             now,
             max_delay: 166_666.0,
-            peer_consumed: 0.0,
         }
     }
 
@@ -504,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn admissions_are_counted_for_peers() {
+    fn admissions_are_reported_to_peers_once() {
         let start = Instant::now();
         let store = BucketStore::new(test_config());
         let key = KeyHash::from_key(b"rate:mw:client");
@@ -513,7 +581,17 @@ mod tests {
             store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
         }
 
-        assert_eq!(store.collect_consumption(usize::MAX).get(&key), Some(&3));
+        let report = store.collect_report(usize::MAX, start);
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].key, key);
+        assert_eq!(report[0].admitted, 3);
+        assert_eq!(report[0].last, REALISTIC_NOW);
+        assert_eq!(report[0].limit, LIMIT);
+        assert_eq!(report[0].burst, BURST);
+        assert_eq!(report[0].ttl, TTL);
+
+        // Carried once: the next report says nothing about these three.
+        assert!(store.collect_report(usize::MAX, start).is_empty());
     }
 
     #[test]
@@ -528,15 +606,102 @@ mod tests {
             store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
         }
 
-        let consumed = *store.collect_consumption(usize::MAX).get(&key).unwrap();
+        let admitted = store.collect_report(usize::MAX, start)[0].admitted;
+        assert_eq!(admitted, BURST as u32, "only the burst was admitted");
+    }
+
+    #[test]
+    fn an_expired_entry_is_not_reported() {
+        let start = Instant::now();
+        let store = BucketStore::new(test_config());
+        let key = KeyHash::from_key(b"rate:mw:client");
+
+        store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
+
         assert!(
-            consumed < 40,
-            "rejected requests must not be counted, got {consumed}"
+            store
+                .collect_report(usize::MAX, start + Duration::from_secs(3))
+                .is_empty()
         );
     }
 
     #[test]
-    fn consumption_ages_out_of_the_window() {
+    fn peer_admissions_are_debited_from_the_local_bucket() {
+        let start = Instant::now();
+        let store = BucketStore::new(test_config());
+        let key = KeyHash::from_key(b"rate:mw:client");
+
+        store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
+        store.apply_peer_admissions(
+            key,
+            PeerAdmissions {
+                admitted: 4,
+                last: REALISTIC_NOW,
+                limit: LIMIT,
+                burst: BURST,
+                ttl: TTL,
+            },
+            start,
+        );
+
+        let outcome = store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
+
+        // One taken here, four by the peer, one by this request.
+        assert_eq!(outcome.state.tokens, BURST - 6.0);
+        // What peers did is not re-reported to them.
+        assert_eq!(store.collect_report(usize::MAX, start)[0].admitted, 2);
+    }
+
+    #[test]
+    fn peer_admissions_create_the_entry_for_an_unseen_key() {
+        let start = Instant::now();
+        let store = BucketStore::new(test_config());
+        let key = KeyHash::from_key(b"rate:mw:client");
+
+        store.apply_peer_admissions(
+            key,
+            PeerAdmissions {
+                admitted: 9,
+                last: REALISTIC_NOW,
+                limit: LIMIT,
+                burst: BURST,
+                ttl: TTL,
+            },
+            start,
+        );
+        assert_eq!(store.len(), 1);
+
+        // The peer took nine of ten; this request takes the last one.
+        let outcome = store.apply_request(key, &params_at(REALISTIC_NOW), TTL, start);
+        assert_eq!(outcome.state.tokens, 0.0);
+        assert_eq!(outcome.wait, 0.0);
+    }
+
+    #[test]
+    fn an_entry_created_by_peers_expires_with_the_peers_ttl() {
+        let start = Instant::now();
+        let store = BucketStore::new(test_config());
+        let key = KeyHash::from_key(b"rate:mw:client");
+
+        store.apply_peer_admissions(
+            key,
+            PeerAdmissions {
+                admitted: 9,
+                last: REALISTIC_NOW,
+                limit: LIMIT,
+                burst: BURST,
+                ttl: Duration::from_secs(2),
+            },
+            start,
+        );
+
+        store.sweep_expired(start + Duration::from_secs(3));
+
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn peer_admissions_extend_an_existing_entrys_lifetime() {
         let start = Instant::now();
         let store = BucketStore::new(test_config());
         let key = KeyHash::from_key(b"rate:mw:client");
@@ -544,17 +709,24 @@ mod tests {
         store.apply_request(
             key,
             &params_at(REALISTIC_NOW),
-            Duration::from_secs(60),
+            Duration::from_secs(2),
             start,
         );
-        assert_eq!(store.collect_consumption(usize::MAX).get(&key), Some(&1));
+        store.apply_peer_admissions(
+            key,
+            PeerAdmissions {
+                admitted: 1,
+                last: REALISTIC_NOW,
+                limit: LIMIT,
+                burst: BURST,
+                ttl: Duration::from_secs(60),
+            },
+            start,
+        );
 
-        // A full turn of the ring, which is what a peer's staleness window spans.
-        for _ in 0..SLOT_COUNT {
-            store.advance_tick();
-        }
+        store.sweep_expired(start + Duration::from_secs(5));
 
-        assert_eq!(store.collect_consumption(usize::MAX).get(&key), None);
+        assert_eq!(store.len(), 1);
     }
 
     #[test]
@@ -675,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn a_report_is_truncated_to_the_busiest_keys() {
+    fn a_report_is_truncated_to_the_busiest_keys_and_the_rest_wait_their_turn() {
         let start = Instant::now();
         let store = BucketStore::new(StoreConfig::default());
 
@@ -687,19 +859,25 @@ mod tests {
             }
         }
 
-        let full = store.collect_consumption(usize::MAX);
-        assert_eq!(full.len(), 10);
+        let capped = store.collect_report(3, start);
+        assert_eq!(capped.len(), 3, "got {} keys", capped.len());
 
-        let capped = store.collect_consumption(3);
-        assert!(capped.len() <= 3, "got {} keys", capped.len());
-
-        // What survives is what matters: the keys this replica has taken most for, since
-        // those are the ones a peer's decision actually turns on.
-        let smallest_kept = capped.values().min().copied().unwrap_or(0);
+        // What goes first is what matters most: the keys this replica has taken most for,
+        // since those are the ones a peer's level is furthest from.
+        let smallest_sent = capped.iter().map(|line| line.admitted).min().unwrap();
         assert!(
-            smallest_kept >= 8,
-            "the busiest keys should survive, kept a key with only {smallest_kept}"
+            smallest_sent >= 8,
+            "the busiest keys should go first, sent a key with only {smallest_sent}"
         );
+
+        // Nothing was lost: the deferred keys go in the next report, counts intact.
+        let rest = store.collect_report(usize::MAX, start);
+        assert_eq!(rest.len(), 7);
+        assert_eq!(
+            rest.iter().map(|line| line.admitted).sum::<u32>(),
+            1 + 2 + 3 + 4 + 5 + 6 + 7
+        );
+        assert!(store.collect_report(usize::MAX, start).is_empty());
     }
 
     #[test]
