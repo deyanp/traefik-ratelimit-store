@@ -59,7 +59,7 @@ jobs:
         # The runtime image is distroless, so what this finds is the C runtime and the
         # binary's own statically linked code. Fixable critical findings fail the build;
         # the report lists everything.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: traefik-ratelimit-store:ci
           severity: CRITICAL
