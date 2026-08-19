@@ -38,6 +38,24 @@ Eight command names are answered. Everything else answers with an error.
 | `EVALSHA` | Serves a known digest, otherwise `NOSCRIPT` |
 | `EVAL` | Validates the source, registers its digest, serves |
 
+## How limits are scoped
+
+The key the proxy sends is `rate:<qualifiedMiddlewareName>:<source>` — the middleware's
+namespaced name plus the client (the IP, under `sourceCriterion.ipStrategy`). The router
+is deliberately not part of it, so **scope follows the Middleware object, not the route**:
+
+- One Middleware referenced by every route = one budget per client across all of them —
+  a client spending its rate on one API has nothing left for the others.
+- Separate budgets per service = separate Middleware CRDs. Only the *name* separates
+  buckets; two middlewares with identical settings still count apart.
+- Chained rate-limit middlewares each keep their own bucket; the stricter one bites first.
+
+The configuration (`average`, `burst`, `period`) is not part of the key either — it arrives
+with every request, so editing a Middleware takes effect on the next request against the
+same counters. Note the contrast with Traefik's in-memory limiter, which keeps one bucket
+map per *router*: there, one shared middleware on fourteen routes and N proxy pods is
+14 × N budgets per client. Through the store it is exactly one.
+
 ## How the script check works
 
 The registry starts empty, so the first `EVALSHA` is answered `NOSCRIPT`. The client then
@@ -214,10 +232,13 @@ even that.
 
 | Operation | Cost |
 |---|---|
-| `apply_request`, one key | 44ns |
-| `apply_request`, distinct keys | 170ns |
-| `sweep_expired`, 200k entries | 572us |
-| capacity trim, worst case | 540us |
+| `apply_request`, one key | 18ns |
+| `apply_request`, distinct keys | 142ns |
+| `sweep_expired`, 200k entries | 716us |
+| capacity trim, worst case | 554us |
+| `collect_report`, 200k touched keys capped to 10k | 4.7ms |
+| encode / decode a 10k-key report | 28us / 29us |
+| fold a 10k-key report into the receiving store | 368us |
 
 The store contributes tens of nanoseconds to a request that costs tens of microseconds end
 to end — almost all of the measured latency is socket and scheduling, not this code. The
@@ -332,12 +353,13 @@ reaches the endpoint can claim admissions for a key and throttle it, or claim a 
 far in the future and refill a drained bucket. Do that to each replica and the limit is
 whatever the stranger says it is.
 
-A NetworkPolicy is the other half, not a substitute — k3s and k3d ship flannel, which does
-not enforce NetworkPolicy at all, and on managed clusters it holds only where the CNI
-enforces it. The shipped manifest carries one: the protocol port admits only pods labelled
-as Traefik, the peer port only the store's own replicas (and the kubelet, for probes). The
-protocol port needs it most — `AUTH` is accepted unconditionally, so anything that can
-reach 6379 can drive any bucket.
+A NetworkPolicy is the other half, not a substitute, and the shipped manifest carries one:
+the protocol port admits only pods labelled as Traefik, the peer port only the store's own
+replicas (and the kubelet, for probes). The protocol port needs it most — `AUTH` is
+accepted unconditionally, so anything that can reach 6379 can drive any bucket. Whether it
+holds depends on the cluster: k3s enforces it through its embedded policy controller
+(verified live — an unlabelled pod is refused before the store sees a packet), and managed
+clusters enforce it where their CNI does. Confirm on yours rather than assuming.
 
 Neither default is safe, so there is no default. A replica with `PEER_ENDPOINT` set and no
 `PEER_SHARED_SECRET` **refuses to start**, naming both ways out. Requiring a secret that
@@ -459,20 +481,27 @@ up the whole chain. Copy it into a Traefik checkout as `conformance-probe/main.g
 
 ## Deployment
 
-`deploy/traefik-ratelimit-store.yaml` — three replicas, two Services (a ClusterIP for the
-proxy, a headless one for peer discovery), a PodDisruptionBudget and topology spread.
+`deploy/traefik-ratelimit-store.yaml` — three replicas rolled in place (no surge pod, so a
+rollout needs no spare scheduling slot), two Services (a ClusterIP for the proxy, a
+headless one for peer discovery), a PodDisruptionBudget, topology spread, and the
+NetworkPolicy for both ports.
 
 ```sh
 docker build -t traefik-ratelimit-store:0.1.0 .
+# Without the secret the replicas refuse to start, deliberately (see Security).
+kubectl create secret generic traefik-ratelimit-store     --from-literal=peer-shared-secret="$(openssl rand -hex 32)"
 kubectl apply -f deploy/traefik-ratelimit-store.yaml
 ```
 
 ## Status
 
-Built and tested; **not deployed**. `DESIGN.md` carries the full rationale, including the
-decision record and the conditions under which this should not be built at all.
+Built, tested, and running in a development cluster behind real Traefik — three replicas
+enforcing one shared limit, load-tested in place at 10M requests (192k requests/s, p99
+27.8ms, nothing dropped). **Not in production.** `DESIGN.md` carries the full rationale,
+including the decision record and the conditions under which this should not be built at
+all.
 
-Deployment is gated on one upstream change. Traefik has no `denyOnError` for its rate-limit
+Production deployment is gated on one upstream change. Traefik has no `denyOnError` for its rate-limit
 middleware, so any store error becomes a 500 — [PR #13529] adds it. Until that lands,
 adopting this, or any external store, means accepting fail-closed on the request path.
 

@@ -587,10 +587,14 @@ claim admissions for a key and throttle it, or claim a timestamp far in the futu
 refill a drained bucket — the level refills up to the claimed moment before the debit. Do
 that to each replica and the limit is whatever the stranger says it is.
 
-A NetworkPolicy is the other half rather than a substitute — k3s and k3d ship flannel, which
-does not enforce NetworkPolicy at all. The shipped manifest carries one anyway, and it
-matters more for the protocol port: `AUTH` is accepted unconditionally, so anything that can
-reach 6379 can drive any bucket directly.
+A NetworkPolicy is the other half rather than a substitute. The shipped manifest carries
+one, and it matters more for the protocol port: `AUTH` is accepted unconditionally, so
+anything that can reach 6379 can drive any bucket directly. An earlier revision of this
+section claimed k3s does not enforce NetworkPolicy because it ships flannel; that confused
+the CNI with the policy controller — k3s enforces through its embedded controller, proven
+live when a load-test pod without the permitted label was refused before the store saw a
+packet. Enforcement is still the cluster's property, not this manifest's: confirm it where
+it matters.
 
 **Neither default is safe, so there is no default.** Requiring a secret that has not been
 configured would reject every report, leave every replica counting alone, and reach the
