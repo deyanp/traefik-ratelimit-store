@@ -47,3 +47,11 @@ pub const PEER_REPORT_REFUSED: (u32, &str) = (8013, "PeerReportRefused");
 
 /// A background task that must run for the process's lifetime has stopped.
 pub const BACKGROUND_TASK_STOPPED: (u32, &str) = (8014, "BackgroundTaskStopped");
+
+/// The caller sent a pinned script text for the first time; its digest is now served
+/// directly. Once per revision, so an upgrade's progress can be read from the log.
+pub const SCRIPT_REGISTERED: (u32, &str) = (8015, "ScriptRegistered");
+
+/// The connection ceiling was reached; new connections are refused until one closes.
+/// Emitted when the ceiling is reached, not per refused connection.
+pub const CONNECTIONS_AT_CAPACITY: (u32, &str) = (8016, "ConnectionsAtCapacity");

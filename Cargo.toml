@@ -7,12 +7,13 @@ autotests = false
 [dependencies]
 tokio              = { version = "1.53", features = ["full"] }
 axum               = "0.8"
-# Peer traffic is plain in-cluster HTTP, so no TLS backend is pulled in.
-reqwest            = { version = "0.13", default-features = false, features = ["json"] }
+# Peer traffic is plain in-cluster HTTP, so no TLS backend is pulled in; reports are
+# serialised once per interval with serde_json directly, so no JSON helper either.
+reqwest            = { version = "0.13", default-features = false }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha1               = "0.11"
 hex                = "0.4"
 dotenvy            = "0.15"
@@ -28,3 +29,10 @@ mlua     = { version = "0.12", features = ["lua51", "vendored"] }
 [[test]]
 name    = "main"
 harness = false
+
+# The hot path is parse, hash, format: whole-program optimisation lets those inline across
+# crates, and one codegen unit lets the optimiser see all of it. `panic` stays `unwind` on
+# purpose — a panic in a connection task then ends that connection, not every connection.
+[profile.release]
+lto           = "fat"
+codegen-units = 1

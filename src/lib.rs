@@ -1,3 +1,4 @@
+// Leaf modules first, the composition points last, so the crate reads bottom-up.
 pub mod app_env;
 pub mod bucket;
 pub mod commands;

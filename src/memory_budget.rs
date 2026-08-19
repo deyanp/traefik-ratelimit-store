@@ -8,16 +8,12 @@
 
 use std::fs;
 
-/// Measured cost of one entry once the map has grown, with a little rounding up.
+/// Share of the budget the shard tables may occupy.
 ///
-/// See `examples/memory_per_key`: 390 bytes at a million keys, less below that.
-const BYTES_PER_ENTRY: usize = 400;
-
-/// Share of the budget entries may occupy.
-///
-/// The rest goes to connection buffers — about 18KB each — the allocator's slack, and the
-/// binary itself. Half is deliberately generous: being killed costs far more than holding
-/// fewer keys than the machine could technically fit.
+/// The rest goes to connection buffers (about 15KB each at full concurrency, measured),
+/// the allocator's slack, the peer reports in flight, and the binary itself. Half is
+/// deliberately generous: being killed costs far more than holding fewer keys than the
+/// machine could technically fit.
 const ENTRY_SHARE: f64 = 0.5;
 
 /// Used when no limit can be discovered, which is the usual case off Linux.
@@ -60,12 +56,29 @@ pub fn resolve_budget_bytes(configured_mb: Option<usize>) -> usize {
 
 /// How many entries each shard may hold before the store starts trimming.
 ///
-/// Never zero: a store that can hold nothing would trim on every insert and serve every
-/// request against a full bucket, which is a rate limiter that does not limit.
-pub fn entries_per_shard(budget_bytes: usize, shard_count: usize) -> usize {
-    let entries = (budget_bytes as f64 * ENTRY_SHARE) as usize / BYTES_PER_ENTRY;
+/// Each shard's table is allocated once, at a power-of-two number of slots, and never
+/// grows. So the ceiling is chosen the other way round: the largest table whose slots fit
+/// the shard's share of the budget, filled to the seven-eighths the map allows. The figure
+/// planned for is then the figure allocated — measured at 170 bytes per key on Linux with
+/// growing tables, and exactly `BYTES_PER_SLOT` per slot with these.
+///
+/// Never below a floor: a store that can hold nothing would trim on every insert and serve
+/// every request against a full bucket, which is a rate limiter that does not limit.
+pub fn derive_entries_per_shard(budget_bytes: usize, shard_count: usize) -> usize {
+    let share_per_shard = (budget_bytes as f64 * ENTRY_SHARE) as usize / shard_count.max(1);
+    let slots_that_fit = share_per_shard / crate::store::BYTES_PER_SLOT;
 
-    (entries / shard_count.max(1)).max(1_024)
+    let mut slots = 1usize;
+    while slots * 2 <= slots_that_fit {
+        slots *= 2;
+    }
+
+    (slots * 7 / 8).max(1_024)
+}
+
+/// What the shard tables will occupy for a ceiling: the figure to log beside it.
+pub fn compute_table_bytes(entries_per_shard: usize, shard_count: usize) -> usize {
+    crate::store::count_slots_for(entries_per_shard) * crate::store::BYTES_PER_SLOT * shard_count
 }
 
 #[cfg(test)]
@@ -81,29 +94,39 @@ mod tests {
     fn the_shipped_limit_yields_a_ceiling_that_fits_inside_it() {
         let budget = 128 * 1024 * 1024;
 
-        let per_shard = entries_per_shard(budget, 16);
-        let worst_case = per_shard * 16 * BYTES_PER_ENTRY;
+        let per_shard = derive_entries_per_shard(budget, 16);
+        let allocated = compute_table_bytes(per_shard, 16);
 
         assert!(
-            worst_case < budget,
-            "{worst_case} bytes of entries must fit inside a {budget} byte budget"
+            allocated <= budget / 2,
+            "{allocated} bytes of tables must fit the entries' half of a {budget} byte budget"
         );
         // And it should not be so conservative as to be useless.
         assert!(per_shard * 16 > 100_000, "got {per_shard} per shard");
     }
 
     #[test]
-    fn a_larger_budget_holds_proportionally_more() {
-        let small = entries_per_shard(128 * 1024 * 1024, 16);
-        let large = entries_per_shard(512 * 1024 * 1024, 16);
+    fn the_ceiling_fills_the_table_it_allocates() {
+        // The table is a power of two of slots; the ceiling is seven-eighths of it, which is
+        // exactly the load the map grows at. Planning for less would waste the slots;
+        // planning for more would make the map grow under a shard's lock.
+        let per_shard = derive_entries_per_shard(128 * 1024 * 1024, 16);
 
-        // Proportional to within the rounding that two integer divisions cost.
-        assert!(large.abs_diff(small * 4) <= 16, "{small} then {large}");
+        assert_eq!(crate::store::count_slots_for(per_shard) * 7 / 8, per_shard);
+    }
+
+    #[test]
+    fn a_larger_budget_holds_more() {
+        let small = derive_entries_per_shard(128 * 1024 * 1024, 16);
+        let large = derive_entries_per_shard(512 * 1024 * 1024, 16);
+
+        // Four times the budget is four times the slots: two doublings.
+        assert_eq!(large, small * 4, "{small} then {large}");
     }
 
     #[test]
     fn a_tiny_budget_still_leaves_room_to_store_something() {
         // Below this the store would trim on every insert and stop limiting anything.
-        assert_eq!(entries_per_shard(1024, 16), 1_024);
+        assert_eq!(derive_entries_per_shard(1024, 16), 1_024);
     }
 }

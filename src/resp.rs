@@ -1,8 +1,14 @@
 //! RESP2 framing.
 //!
 //! Only the subset a rate-limit client exercises is implemented: inbound commands are
-//! always arrays of bulk strings, and outbound replies are simple strings, errors, or
-//! arrays of bulk strings.
+//! always arrays of bulk strings, and outbound replies are simple strings, errors, or the
+//! three-element array the bucket evaluation produces.
+//!
+//! Parsing borrows from the connection's buffer rather than copying each argument out,
+//! and encoding writes straight into the connection's output buffer: a request costs no
+//! heap allocation beyond the vector of argument slices.
+
+use std::io::Write;
 
 use crate::errors::ProtocolError;
 
@@ -14,47 +20,57 @@ const MAX_ELEMENT_LENGTH: i64 = 1 << 20;
 const MAX_ARGUMENT_COUNT: i64 = 64;
 
 /// What the store sends back.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Reply {
     /// `+OK`-style status line.
     Simple(&'static str),
     /// `-ERR …` error line. The caller treats these as data, not as a broken connection.
     Error(String),
-    /// `$…` length-prefixed string.
-    Bulk(String),
-    /// `*…` array.
-    Array(Vec<Reply>),
+    /// The bucket evaluation's reply: a three-element array of bulk strings, in which the
+    /// first is always the literal `true`, the second the wait and the third the tokens.
+    /// The caller reads the first as a boolean and the second as a float; the third is
+    /// returned for symmetry with the script it replaces and is not read.
+    Bucket { wait: f64, tokens: f64 },
 }
 
 /// The outcome of attempting to read one command from a connection buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ParseOutcome {
+pub enum ParseOutcome<'a> {
     /// A whole command was read, consuming `consumed` bytes from the front of the buffer.
-    Complete { args: Vec<Vec<u8>>, consumed: usize },
-    /// The buffer holds a prefix of a command; read more and try again.
-    Incomplete,
+    Complete {
+        args: Vec<&'a [u8]>,
+        consumed: usize,
+    },
+    /// The buffer holds a prefix of a command. `at_least` is the buffer length below which
+    /// another attempt cannot succeed, so a caller receiving one byte at a time need not
+    /// re-parse the prefix on every byte.
+    Incomplete { at_least: usize },
+}
+
+/// A partial result: either the value, or how long the buffer must be before retrying.
+enum Step<T> {
+    Done(T),
+    More(usize),
 }
 
 /// Finds the end of a CRLF-terminated line starting at `from`.
 ///
 /// Returns the index of the `\r`, or `None` when the terminator has not arrived yet.
 fn find_line_end(buffer: &[u8], from: usize) -> Option<usize> {
-    let mut index = from;
-    while index + 1 < buffer.len() {
-        if buffer[index] == b'\r' && buffer[index + 1] == b'\n' {
-            return Some(index);
-        }
-        index += 1;
-    }
-    None
+    buffer
+        .get(from..)?
+        .windows(2)
+        .position(|pair| pair == b"\r\n")
+        .map(|offset| from + offset)
 }
 
 /// Reads the decimal number following a type byte at `from`.
 ///
 /// Returns the value and the index just past the line's CRLF.
-fn parse_length(buffer: &[u8], from: usize) -> Result<Option<(i64, usize)>, ProtocolError> {
+fn parse_length(buffer: &[u8], from: usize) -> Result<Step<(i64, usize)>, ProtocolError> {
     let Some(line_end) = find_line_end(buffer, from) else {
-        return Ok(None);
+        // The terminator could arrive with the very next byte.
+        return Ok(Step::More(buffer.len() + 1));
     };
 
     let digits =
@@ -64,23 +80,21 @@ fn parse_length(buffer: &[u8], from: usize) -> Result<Option<(i64, usize)>, Prot
         .parse()
         .map_err(|_| ProtocolError::MalformedLength)?;
 
-    Ok(Some((value, line_end + 2)))
+    Ok(Step::Done((value, line_end + 2)))
 }
 
 /// Reads one bulk string beginning at `from`, returning it and the index just past it.
-fn parse_bulk_argument(
-    buffer: &[u8],
-    from: usize,
-) -> Result<Option<(Vec<u8>, usize)>, ProtocolError> {
+fn parse_bulk_argument(buffer: &[u8], from: usize) -> Result<Step<(&[u8], usize)>, ProtocolError> {
     if from >= buffer.len() {
-        return Ok(None);
+        return Ok(Step::More(from + 1));
     }
     if buffer[from] != b'$' {
         return Err(ProtocolError::NonBulkArgument(buffer[from]));
     }
 
-    let Some((length, after_length)) = parse_length(buffer, from + 1)? else {
-        return Ok(None);
+    let (length, after_length) = match parse_length(buffer, from + 1)? {
+        Step::Done(parsed) => parsed,
+        Step::More(at_least) => return Ok(Step::More(at_least)),
     };
     if !(0..=MAX_ELEMENT_LENGTH).contains(&length) {
         return Err(ProtocolError::LengthTooLarge(length));
@@ -89,26 +103,28 @@ fn parse_bulk_argument(
     let length = length as usize;
     let end = after_length + length;
     if buffer.len() < end + 2 {
-        return Ok(None);
+        // The length is known, so the buffer must reach past the payload's terminator.
+        return Ok(Step::More(end + 2));
     }
     if &buffer[end..end + 2] != b"\r\n" {
         return Err(ProtocolError::MissingTerminator);
     }
 
-    Ok(Some((buffer[after_length..end].to_vec(), end + 2)))
+    Ok(Step::Done((&buffer[after_length..end], end + 2)))
 }
 
 /// Attempts to read one command from the front of `buffer`.
-pub fn parse_command(buffer: &[u8]) -> Result<ParseOutcome, ProtocolError> {
+pub fn parse_command(buffer: &[u8]) -> Result<ParseOutcome<'_>, ProtocolError> {
     if buffer.is_empty() {
-        return Ok(ParseOutcome::Incomplete);
+        return Ok(ParseOutcome::Incomplete { at_least: 1 });
     }
     if buffer[0] != b'*' {
         return Err(ProtocolError::UnexpectedType(buffer[0]));
     }
 
-    let Some((count, mut cursor)) = parse_length(buffer, 1)? else {
-        return Ok(ParseOutcome::Incomplete);
+    let (count, mut cursor) = match parse_length(buffer, 1)? {
+        Step::Done(parsed) => parsed,
+        Step::More(at_least) => return Ok(ParseOutcome::Incomplete { at_least }),
     };
     if !(0..=MAX_ARGUMENT_COUNT).contains(&count) {
         return Err(ProtocolError::LengthTooLarge(count));
@@ -116,8 +132,9 @@ pub fn parse_command(buffer: &[u8]) -> Result<ParseOutcome, ProtocolError> {
 
     let mut args = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let Some((argument, next)) = parse_bulk_argument(buffer, cursor)? else {
-            return Ok(ParseOutcome::Incomplete);
+        let (argument, next) = match parse_bulk_argument(buffer, cursor)? {
+            Step::Done(parsed) => parsed,
+            Step::More(at_least) => return Ok(ParseOutcome::Incomplete { at_least }),
         };
         args.push(argument);
         cursor = next;
@@ -127,6 +144,31 @@ pub fn parse_command(buffer: &[u8]) -> Result<ParseOutcome, ProtocolError> {
         args,
         consumed: cursor,
     })
+}
+
+/// Appends one bulk string holding the decimal form of `value`.
+///
+/// Rendered into a stack buffer first, because the length prefix has to be written before
+/// the digits. Shortest round-trip representation, which the caller's float parser
+/// accepts. A value too long for the stack buffer — only an absurd magnitude gets there —
+/// takes the allocating path rather than being truncated.
+fn encode_number_bulk(out: &mut Vec<u8>, value: f64) {
+    let mut digits = [0u8; 64];
+    let mut cursor = std::io::Cursor::new(&mut digits[..]);
+    let rendered: &[u8] = if write!(cursor, "{value}").is_ok() {
+        let length = cursor.position() as usize;
+        &digits[..length]
+    } else {
+        let text = value.to_string();
+        let _ = write!(out, "${}\r\n", text.len());
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        return;
+    };
+
+    let _ = write!(out, "${}\r\n", rendered.len());
+    out.extend_from_slice(rendered);
+    out.extend_from_slice(b"\r\n");
 }
 
 /// Appends the wire form of `reply` to `out`.
@@ -142,20 +184,10 @@ pub fn encode_reply(reply: &Reply, out: &mut Vec<u8>) {
             out.extend_from_slice(text.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
-        Reply::Bulk(text) => {
-            out.push(b'$');
-            out.extend_from_slice(text.len().to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
-            out.extend_from_slice(text.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        Reply::Array(items) => {
-            out.push(b'*');
-            out.extend_from_slice(items.len().to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
-            for item in items {
-                encode_reply(item, out);
-            }
+        Reply::Bucket { wait, tokens } => {
+            out.extend_from_slice(b"*3\r\n$4\r\ntrue\r\n");
+            encode_number_bulk(out, *wait);
+            encode_number_bulk(out, *tokens);
         }
     }
 }
@@ -179,7 +211,7 @@ mod tests {
         assert_eq!(
             outcome,
             ParseOutcome::Complete {
-                args: vec![b"PING".to_vec(), b"hi".to_vec()],
+                args: vec![b"PING".as_slice(), b"hi".as_slice()],
                 consumed: wire.len(),
             }
         );
@@ -190,11 +222,32 @@ mod tests {
         let wire = b"*2\r\n$4\r\nPING\r\n$2\r\nhi\r\n";
 
         for split in 0..wire.len() {
-            assert_eq!(
-                parse_command(&wire[..split]).unwrap(),
-                ParseOutcome::Incomplete
+            assert!(
+                matches!(
+                    parse_command(&wire[..split]).unwrap(),
+                    ParseOutcome::Incomplete { .. }
+                ),
+                "split at {split}"
             );
         }
+    }
+
+    #[test]
+    fn an_incomplete_prefix_says_how_much_more_it_needs() {
+        // Once a bulk length is known, the parser knows exactly how long the buffer must
+        // be, so a caller fed one byte at a time can skip re-parsing until then.
+        let wire = b"*1\r\n$4\r\nPING\r\n";
+
+        let ParseOutcome::Incomplete { at_least } = parse_command(&wire[..8]).unwrap() else {
+            panic!("expected an incomplete command");
+        };
+
+        assert_eq!(at_least, wire.len());
+        // And the hint is never a lie: the buffer at that length parses.
+        assert!(matches!(
+            parse_command(&wire[..at_least]).unwrap(),
+            ParseOutcome::Complete { .. }
+        ));
     }
 
     #[test]
@@ -226,16 +279,47 @@ mod tests {
 
     #[test]
     fn encodes_the_script_reply_shape() {
-        let reply = Reply::Array(vec![
-            Reply::Bulk("true".to_string()),
-            Reply::Bulk("0".to_string()),
-            Reply::Bulk("9".to_string()),
-        ]);
+        let reply = Reply::Bucket {
+            wait: 0.0,
+            tokens: 9.0,
+        };
 
         assert_eq!(
             encoded(&reply),
             "*3\r\n$4\r\ntrue\r\n$1\r\n0\r\n$1\r\n9\r\n"
         );
+    }
+
+    #[test]
+    fn numbers_are_rendered_the_way_the_callers_parser_reads_them() {
+        // Shortest round-trip, no exponent, fractional part only when there is one —
+        // the same text `f64::to_string` produces, which the caller has always parsed.
+        let reply = Reply::Bucket {
+            wait: 133_333.33333333334,
+            tokens: -0.4,
+        };
+
+        assert_eq!(
+            encoded(&reply),
+            format!(
+                "*3\r\n$4\r\ntrue\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                "133333.33333333334".len(),
+                "133333.33333333334",
+                "-0.4".len(),
+                "-0.4"
+            )
+        );
+    }
+
+    #[test]
+    fn a_number_too_long_for_the_stack_buffer_is_still_rendered_whole() {
+        let reply = Reply::Bucket {
+            wait: 0.0,
+            tokens: f64::MAX,
+        };
+        let text = f64::MAX.to_string();
+
+        assert!(encoded(&reply).ends_with(&format!("${}\r\n{text}\r\n", text.len())));
     }
 
     #[test]

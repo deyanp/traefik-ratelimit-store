@@ -5,8 +5,9 @@
 //! traffic. A draining replica is emphatically alive, and a liveness probe that fails
 //! during a drain kills the pod it was meant to let finish.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -17,6 +18,11 @@ const PONG: &[u8] = b"+PONG\r\n";
 
 /// How long the self-check waits before deciding the listener is not answering.
 const SELF_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long a self-check result is reused. The probe is unauthenticated, and each check
+/// opens a connection to the protocol port; answering from a recent result means a caller
+/// hammering the probe cannot turn it into connections against the listener.
+const SELF_CHECK_REUSE: Duration = Duration::from_secs(1);
 
 /// Whether this replica is willing to receive traffic.
 ///
@@ -29,13 +35,16 @@ pub struct Health {
     /// The protocol listener's own address, so the check exercises the port that carries
     /// production traffic rather than the one serving the probe.
     protocol_address: String,
+    /// The last self-check's verdict and when it was reached.
+    last_check: Mutex<Option<(Instant, bool)>>,
 }
 
 impl Health {
     pub fn new(protocol_address: String) -> Self {
         Self {
             serving: AtomicBool::new(true),
-            protocol_address: loopback_form(&protocol_address),
+            protocol_address: to_loopback_form(&protocol_address),
+            last_check: Mutex::new(None),
         }
     }
 
@@ -52,8 +61,17 @@ impl Health {
     ///
     /// Deliberately does not touch the store. A probe that acquires production locks can
     /// cause the stall it is looking for, and a store wedged badly enough to matter fails
-    /// this check anyway by never completing it.
+    /// this check anyway by never completing it. A verdict younger than
+    /// [`SELF_CHECK_REUSE`] is returned as is.
     pub async fn protocol_listener_answers(&self) -> bool {
+        let now = Instant::now();
+        if let Some((checked_at, answered)) =
+            *self.last_check.lock().unwrap_or_else(|p| p.into_inner())
+            && now.duration_since(checked_at) < SELF_CHECK_REUSE
+        {
+            return answered;
+        }
+
         let attempt = async {
             let mut stream = TcpStream::connect(&self.protocol_address).await.ok()?;
             stream.write_all(PING).await.ok()?;
@@ -64,11 +82,13 @@ impl Health {
             (reply == PONG).then_some(())
         };
 
-        tokio::time::timeout(SELF_CHECK_TIMEOUT, attempt)
+        let answered = tokio::time::timeout(SELF_CHECK_TIMEOUT, attempt)
             .await
             .ok()
             .flatten()
-            .is_some()
+            .is_some();
+        *self.last_check.lock().unwrap_or_else(|p| p.into_inner()) = Some((now, answered));
+        answered
     }
 }
 
@@ -76,7 +96,7 @@ impl Health {
 ///
 /// A listener bound to `0.0.0.0:6379` is reachable at `127.0.0.1:6379`, but connecting to
 /// the wildcard itself is not portable.
-fn loopback_form(address: &str) -> String {
+fn to_loopback_form(address: &str) -> String {
     match address.rsplit_once(':') {
         Some((host, port)) if host.is_empty() || host == "0.0.0.0" || host == "*" => {
             format!("127.0.0.1:{port}")
@@ -92,15 +112,15 @@ mod tests {
 
     #[test]
     fn a_wildcard_bind_address_becomes_loopback() {
-        assert_eq!(loopback_form("0.0.0.0:6379"), "127.0.0.1:6379");
-        assert_eq!(loopback_form(":6379"), "127.0.0.1:6379");
-        assert_eq!(loopback_form("[::]:6379"), "[::1]:6379");
+        assert_eq!(to_loopback_form("0.0.0.0:6379"), "127.0.0.1:6379");
+        assert_eq!(to_loopback_form(":6379"), "127.0.0.1:6379");
+        assert_eq!(to_loopback_form("[::]:6379"), "[::1]:6379");
     }
 
     #[test]
     fn an_explicit_address_is_left_alone() {
-        assert_eq!(loopback_form("10.0.0.1:6379"), "10.0.0.1:6379");
-        assert_eq!(loopback_form("127.0.0.1:16379"), "127.0.0.1:16379");
+        assert_eq!(to_loopback_form("10.0.0.1:6379"), "10.0.0.1:6379");
+        assert_eq!(to_loopback_form("127.0.0.1:16379"), "127.0.0.1:16379");
     }
 
     #[test]
@@ -127,5 +147,36 @@ mod tests {
         let health = Health::new("127.0.0.1:1".to_string());
 
         assert!(!health.protocol_listener_answers().await);
+    }
+
+    #[tokio::test]
+    async fn a_recent_verdict_is_reused_rather_than_rechecked() {
+        // A listener that appears after the first check is not seen until the verdict
+        // ages out — which is the point: one connection to the listener per second, however
+        // often the probe is called.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let health = Health::new(address.clone());
+        assert!(!health.protocol_listener_answers().await);
+
+        let listener = tokio::net::TcpListener::bind(&address).await.unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 64];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(PONG).await;
+            }
+        });
+
+        assert!(
+            !health.protocol_listener_answers().await,
+            "reused within the window"
+        );
+        tokio::time::sleep(SELF_CHECK_REUSE + Duration::from_millis(50)).await;
+        assert!(
+            health.protocol_listener_answers().await,
+            "rechecked after it"
+        );
     }
 }

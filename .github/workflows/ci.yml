@@ -33,6 +33,18 @@ jobs:
         # source. That is a dev-dependency only; the shipped binary contains no interpreter.
         run: cargo test --all-targets
 
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Advisories
+        # Every dependency in Cargo.lock against the RustSec database. A known
+        # vulnerability in the tree fails the build; the lockfile is what ships.
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   image:
     runs-on: ubuntu-latest
     steps:
@@ -42,3 +54,14 @@ jobs:
         # Not pushed. Proving the image builds is the point; publishing is a release
         # concern and belongs to whatever promotes a tag.
         run: docker build -t traefik-ratelimit-store:ci .
+
+      - name: Scan the image
+        # The runtime image is distroless, so what this finds is the C runtime and the
+        # binary's own statically linked code. Fixable critical findings fail the build;
+        # the report lists everything.
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: traefik-ratelimit-store:ci
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

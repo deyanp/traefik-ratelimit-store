@@ -239,21 +239,31 @@ again, and costs nothing.
 ### 6.5 The ceiling is derived, not configured
 
 The entry ceiling and the container's memory limit are one decision. An earlier version of
-this design set them apart — a 128Mi limit beside a ceiling of a million entries — and an
-entry costs about 390 bytes once the map has grown, so the process would have been killed
-at roughly 350k keys while its own backstop still reported headroom. A backstop above the
-limit it protects is decoration.
+this design set them apart — a 128Mi limit beside a ceiling of a million entries — and a
+million entries is well over a hundred megabytes, so the process would have been killed at
+a few hundred thousand keys while its own backstop still reported headroom. A backstop
+above the limit it protects is decoration.
 
 So the store reads the container's limit from cgroup (a kernel facility, so it behaves the
-same under Kubernetes, Docker and systemd), gives entries half of it, and derives the
-per-shard ceiling. It logs what it chose. `STORE_MEMORY_BUDGET_MB` overrides the discovered
-limit; `STORE_CAPACITY_PER_SHARD` overrides the result; neither is normally needed.
+same under Kubernetes, Docker and systemd), gives the shard tables half of it, and derives
+the per-shard ceiling. Each table is allocated once, at the largest power of two of slots
+that fits its share — 81 bytes a slot: the 16-byte key, the 56-byte entry, one control
+byte — and the ceiling is the seven-eighths of that the map fills before it would grow. The
+figure planned for is therefore the figure allocated, and no table ever grows under a
+shard's lock while requests wait. It logs what it chose. `STORE_MEMORY_BUDGET_MB` overrides
+the discovered limit (the shipped manifest feeds it from the container's own limit through
+the Downward API, so there is nothing to keep in step); `STORE_CAPACITY_PER_SHARD` overrides
+the result; neither is normally needed.
 
-| memory limit | entries held |
-|---|---|
-| 128Mi | 167,760 |
-| 256Mi | 335,536 |
-| 512Mi | 671,088 |
+| memory limit | entries held | tables |
+|---|---|---|
+| 128Mi | 458,752 | 40.5MB |
+| 256Mi | 917,504 | 81MB |
+| 512Mi | 1,835,008 | 162MB |
+
+The first cut planned for 400 bytes an entry, a figure measured on macOS, whose allocator
+keeps the freed old tables of a growing map resident. Linux measures 170 with growing tables
+and exactly the slot size with pre-sized ones (§15).
 
 ### 6.6 What happens at the ceiling
 
@@ -487,7 +497,7 @@ network errors including connection-refused.
 
 **A hung pod is worse than a dead one.** `context.DeadlineExceeded` is explicitly *not*
 retried, and timeouts retry only conditionally. Design for fast failure: a readiness
-probe that genuinely fails, low timeouts, a bounded accept queue, and a `preStop` drain
+probe that genuinely fails, low timeouts, a bounded accept queue, and a drain on `SIGTERM`
 so terminations close connections rather than stall them.
 
 ---
@@ -507,11 +517,21 @@ It deliberately does not touch the store. A probe that acquires production locks
 the stall it is looking for, and a store wedged badly enough to matter fails this check
 anyway by never completing it.
 
-On `SIGTERM` the process fails readiness first, keeps serving for a drain period, then
-exits — so the orchestrator withdraws the replica before its listener closes. Without that
-ordering the grace period buys nothing: connections keep arriving until the socket
-disappears underneath them. Verified by replacing every replica under load without dropping
-a request (§11.5).
+On `SIGTERM` the process fails readiness first, keeps serving for a drain period
+(`DRAIN_PERIOD_MS`, five seconds by default), then exits — so the orchestrator withdraws
+the replica before its listener closes. Without that ordering the grace period buys
+nothing: connections keep arriving until the socket disappears underneath them. Verified by
+replacing every replica under load without dropping a request (§11.5).
+
+Two mechanisms withdraw a replica, and it is worth being precise about which does what.
+When a pod is *deleted* — a rollout, a scale-down, a node drain — the orchestrator removes
+it from the Service's endpoints the moment it enters `Terminating`, regardless of any
+probe; the drain then only has to outlast the propagation to every node's proxy rules,
+which is what the five seconds are for. The failing readiness probe is the net for the
+other cases — a process told to stop by something other than a deletion — and it needs
+`period × threshold` to be noticed, so the shipped probe runs every two seconds with a
+threshold of two, inside the drain. The termination grace period must in turn exceed the
+drain, or the kill arrives first.
 
 ---
 
@@ -582,6 +602,13 @@ The receiver checks the secret before it parses a body, caps what one report may
 the same `PEER_MAX_KEYS_PER_REPORT` the sender applies, and skips any line it cannot fold
 safely — a non-finite number, a non-positive limit, a malformed key.
 
+What the secret does not do is tell replicas apart: it proves membership of the mesh, not
+identity within it. Any holder of the secret — or one compromised replica — can send a
+report in any shape, and the receiver cannot distinguish it from an honest peer's. Signed
+per-replica reports would close that; nothing in the current threat model, where the
+replicas are one deployment sharing one Secret, asks for it. Recorded so the boundary is
+known, not because it is planned.
+
 ---
 
 ## 10. Observability
@@ -603,6 +630,7 @@ can be inferred from anything else:
 | `PeerPublishFailed` / `PeerDiscoveryEmpty` | No peer can be reached, or the endpoint resolves to nothing |
 | `BackgroundTaskStopped` | The sweeper, publisher or peer endpoint died; the process is exiting |
 | `AcceptFailed` | Connections cannot be accepted, usually the descriptor limit |
+| `ConnectionsAtCapacity` | The connection ceiling was reached; new connections are refused |
 
 ---
 
@@ -785,6 +813,13 @@ all went with the old model.
 decoration: the process would have been killed before it ever trimmed.
 
 **The peer endpoint was documented as a throttling risk** when it is a bypass (§9.1).
+
+**The memory figure was measured on the wrong operating system.** 400 bytes an entry came
+from macOS, whose allocator keeps a growing map's freed old tables resident; Linux, where
+the container runs, measures 170 with growing tables and exactly the 81-byte slot with
+pre-sized ones. The first ceiling was 2.7× too cautious — a safe mistake, but the tables
+are now allocated at their final size so the planned figure and the allocated one are the
+same number, and the README says which platform to measure on.
 
 **Four things could kill a background task silently, and nothing watched.** A zero
 interval panicked the timer, a zero ceiling or report cap panicked the first insert or

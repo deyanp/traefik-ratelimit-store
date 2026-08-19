@@ -72,8 +72,8 @@ spec:
       # A hung replica is worse than a dead one: the client does not retry a timeout, so it
       # becomes a 500 where a closed connection would have been retried onto a healthy
       # replica. On SIGTERM the process fails readiness, keeps serving for its drain
-      # period, then exits — so connections are closed rather than left to stall, and this
-      # must stay longer than that drain period.
+      # period (DRAIN_PERIOD_MS), then exits — so connections are closed rather than left
+      # to stall, and this must stay longer than that drain period.
       terminationGracePeriodSeconds: 20
       containers:
         - name: store
@@ -123,17 +123,32 @@ spec:
                   fieldPath: metadata.name
             # The entry ceiling is derived from this rather than set beside it, because
             # the two are one decision: a ceiling above the limit means the process is
-            # killed before the trim that exists to prevent that ever runs. Left unset the
-            # store reads the cgroup limit itself; it is stated here so the relationship is
-            # visible where the limit is.
+            # killed before the trim that exists to prevent that ever runs. Read from the
+            # container's own memory limit, so there is nothing to keep in step: change
+            # the limit below and the ceiling follows. (Left unset, the store reads the
+            # cgroup limit itself and arrives at the same figure.)
             - name: STORE_MEMORY_BUDGET_MB
-              value: "128"
+              valueFrom:
+                resourceFieldRef:
+                  containerName: store
+                  resource: limits.memory
+                  divisor: 1Mi
+            # Runtime worker threads. The default is the node's core count, which on a
+            # wide node means dozens of threads migrating a few hundred connection tasks
+            # between cores for no gain; four carry the measured load with room to spare.
+            - name: TOKIO_WORKER_THREADS
+              value: "4"
             - name: RUST_LOG
               value: "info"
           resources:
+            # Memory request equals the limit, so the pod is never the one evicted under
+            # node pressure — the proxy answers any store error with a 500. The CPU request
+            # reflects what the measured load actually needs; without it the scheduler
+            # weights this pod as if it were idle when a node is contended. No CPU limit,
+            # deliberately: CFS throttling is what turns a busy replica into tail latency.
             requests:
-              memory: "32Mi"
-              cpu: "50m"
+              memory: "128Mi"
+              cpu: "500m"
             limits:
               memory: "128Mi"
           # Readiness answers for the RESP port by connecting to it, so a replica whose
@@ -141,11 +156,15 @@ spec:
           # serving this probe is still healthy. It also fails immediately on SIGTERM, so
           # the replica is withdrawn before its listener closes — which is the whole point
           # of the grace period below.
+          # Period times threshold must stay below the drain period (DRAIN_PERIOD_MS, five
+          # seconds by default): the drain is what gives a failing probe time to be seen.
+          # Deleting a pod withdraws it from the Service on its own; the probe is the
+          # safety net for the cases that are not a deletion.
           readinessProbe:
             httpGet:
               path: /readiness
               port: peers
-            periodSeconds: 5
+            periodSeconds: 2
             failureThreshold: 2
           # Deliberately a different endpoint. Pointing liveness at readiness would make a
           # draining replica look dead and get it killed part-way through the drain.

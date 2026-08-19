@@ -33,6 +33,18 @@ const REPORT_PATH: &str = "/peer-report";
 /// could legitimately send.
 const BYTES_PER_REPORT_LINE: usize = 160;
 
+#[derive(Clone)]
+struct PeerEndpointState {
+    store: Arc<BucketStore>,
+    replica_id: String,
+    health: Arc<Health>,
+    /// Empty means unauthenticated, and the endpoint then relies entirely on network
+    /// policy to keep strangers out.
+    shared_secret: Arc<String>,
+    /// Most keys one inbound report may carry; the same cap the publisher applies.
+    max_keys_per_report: usize,
+}
+
 /// Turns the configured endpoint into the addresses to publish to.
 ///
 /// A comma-separated value is taken as an explicit list; anything else is resolved, which
@@ -222,23 +234,11 @@ pub async fn run_publisher(store: Arc<BucketStore>, app_env: AppEnv) {
     }
 }
 
-#[derive(Clone)]
-struct PeerEndpointState {
-    store: Arc<BucketStore>,
-    replica_id: String,
-    health: Arc<Health>,
-    /// Empty means unauthenticated, and the endpoint then relies entirely on network
-    /// policy to keep strangers out.
-    shared_secret: Arc<String>,
-    /// Most keys one inbound report may carry; the same cap the publisher applies.
-    max_keys_per_report: usize,
-}
-
 /// Compares two secrets without leaking their similarity through timing.
 ///
 /// The exposure here is small — an attacker inside the cluster has better options — but a
 /// comparison that returns early is a habit worth not forming.
-fn secrets_match(presented: &str, expected: &str) -> bool {
+fn is_same_secret(presented: &str, expected: &str) -> bool {
     if presented.len() != expected.len() {
         return false;
     }
@@ -267,7 +267,7 @@ fn is_authorised(headers: &axum::http::HeaderMap, shared_secret: &str) -> bool {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|presented| secrets_match(presented, shared_secret))
+        .is_some_and(|presented| is_same_secret(presented, shared_secret))
 }
 
 /// Folds a peer's report into this replica's buckets.
@@ -312,7 +312,7 @@ async fn receive_report(
 /// Whether this replica should be restarted. Deliberately trivial: anything that can
 /// restart a pod should be as close to "the process exists" as possible, because a clever
 /// liveness probe causes restart loops under exactly the load it was meant to survive.
-async fn liveness() -> &'static str {
+async fn answer_liveness() -> &'static str {
     "alive"
 }
 
@@ -321,7 +321,7 @@ async fn liveness() -> &'static str {
 /// Answers for the protocol port rather than for itself: a replica whose protocol listener
 /// has stopped but whose peer endpoint still answers must leave the rotation, and a probe
 /// that only proves it can answer its own probe proves nothing.
-async fn readiness(State(state): State<PeerEndpointState>) -> Response {
+async fn answer_readiness(State(state): State<PeerEndpointState>) -> Response {
     if state.health.is_draining() {
         // Said before the listener closes, so the orchestrator withdraws this replica
         // while it can still finish the connections it already holds.
@@ -362,8 +362,8 @@ pub async fn run_peer_endpoint(
     let app = Router::new()
         .route(REPORT_PATH, post(receive_report))
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
-        .route("/health", get(liveness))
-        .route("/readiness", get(readiness))
+        .route("/health", get(answer_liveness))
+        .route("/readiness", get(answer_readiness))
         .with_state(PeerEndpointState {
             store,
             replica_id: app_env.replica_id.clone(),
@@ -418,9 +418,9 @@ mod tests {
 
     #[test]
     fn secrets_of_different_lengths_never_match() {
-        assert!(!secrets_match("short", "much-longer-secret"));
-        assert!(!secrets_match("", "secret"));
-        assert!(secrets_match("same", "same"));
+        assert!(!is_same_secret("short", "much-longer-secret"));
+        assert!(!is_same_secret("", "secret"));
+        assert!(is_same_secret("same", "same"));
     }
 
     #[tokio::test]

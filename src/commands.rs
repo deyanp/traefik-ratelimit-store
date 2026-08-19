@@ -19,19 +19,35 @@ const EVALUATION_ARGUMENT_COUNT: usize = 8;
 /// rate; the cap exists so an arbitrary value cannot pin memory or overflow the clock.
 const MAX_TTL_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
-/// Formats a number the way the caller's parser expects.
+/// What a command produces: the reply, and whether the connection ends after it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Answer {
+    pub reply: Reply,
+    /// `QUIT` is answered and then the connection is closed, as the protocol specifies.
+    pub close_after: bool,
+}
+
+impl Answer {
+    fn reply(reply: Reply) -> Self {
+        Self {
+            reply,
+            close_after: false,
+        }
+    }
+}
+
+/// Pins a number to something the caller's parser can read.
 ///
-/// Shortest round-trip representation, which its float parser accepts. A non-finite wait
-/// can only come from a degenerate `limit`; it is rendered as the largest finite value so
-/// the caller still reads "longer than any acceptable delay" and rejects, rather than a
-/// zero that would admit.
-fn format_number(value: f64) -> String {
+/// A non-finite wait can only come from a degenerate `limit`; it becomes the largest
+/// finite value so the caller still reads "longer than any acceptable delay" and rejects,
+/// rather than a zero that would admit.
+fn pin_finite(value: f64) -> f64 {
     if value.is_finite() {
-        value.to_string()
+        value
     } else if value.is_sign_negative() {
-        f64::MIN.to_string()
+        f64::MIN
     } else {
-        f64::MAX.to_string()
+        f64::MAX
     }
 }
 
@@ -44,40 +60,40 @@ fn parse_number(raw: &[u8]) -> Option<f64> {
         .filter(|v| v.is_finite())
 }
 
-fn error_reply(message: &str) -> Reply {
+fn build_error_reply(message: &str) -> Reply {
     Reply::Error(format!("ERR {message}"))
 }
 
 /// Runs the bucket evaluation described by `args`, which start at the key.
 ///
 /// Layout is `<numkeys> <key> <limit> <burst> <ttl> <now> <max_delay>`.
-fn evaluate_bucket(store: &BucketStore, args: &[Vec<u8>], now: Instant) -> Reply {
-    let Some(key_count) = parse_number(&args[0]) else {
-        return error_reply("numkeys is not a number");
+fn evaluate_bucket(store: &BucketStore, args: &[&[u8]], now: Instant) -> Reply {
+    let Some(key_count) = parse_number(args[0]) else {
+        return build_error_reply("numkeys is not a number");
     };
     if key_count != 1.0 {
-        return error_reply("this store evaluates exactly one key per call");
+        return build_error_reply("this store evaluates exactly one key per call");
     }
 
     let (Some(limit), Some(burst), Some(ttl), Some(caller_now), Some(max_delay)) = (
-        parse_number(&args[2]),
-        parse_number(&args[3]),
-        parse_number(&args[4]),
-        parse_number(&args[5]),
-        parse_number(&args[6]),
+        parse_number(args[2]),
+        parse_number(args[3]),
+        parse_number(args[4]),
+        parse_number(args[5]),
+        parse_number(args[6]),
     ) else {
-        return error_reply("bucket arguments must be numbers");
+        return build_error_reply("bucket arguments must be numbers");
     };
 
     if limit <= 0.0 {
-        return error_reply("limit must be positive");
+        return build_error_reply("limit must be positive");
     }
     // The caller derives the lifetime from the rate; a non-positive one would mean an
     // entry that is expired the moment it is written, and an unbounded one could not be
     // added to the clock.
     let ttl = Duration::from_secs(ttl.clamp(1.0, MAX_TTL_SECONDS) as u64);
 
-    let key = KeyHash::from_key(&args[1]);
+    let key = KeyHash::from_key(args[1]);
     let params = BucketParams {
         limit,
         burst,
@@ -86,24 +102,21 @@ fn evaluate_bucket(store: &BucketStore, args: &[Vec<u8>], now: Instant) -> Reply
     };
     let outcome = store.apply_request(key, &params, ttl, now);
 
-    // The caller reads element 0 as a boolean and element 1 as a float; element 2 is
-    // returned for symmetry with the script and is not read.
-    Reply::Array(vec![
-        Reply::Bulk("true".to_string()),
-        Reply::Bulk(format_number(outcome.wait)),
-        Reply::Bulk(format_number(outcome.state.tokens)),
-    ])
+    Reply::Bucket {
+        wait: pin_finite(outcome.wait),
+        tokens: pin_finite(outcome.state.tokens),
+    }
 }
 
 /// Answers one command.
 pub fn dispatch(
     store: &BucketStore,
     scripts: &ScriptRegistry,
-    args: &[Vec<u8>],
+    args: &[&[u8]],
     now: Instant,
-) -> Reply {
+) -> Answer {
     let Some(name) = args.first() else {
-        return error_reply("empty command");
+        return Answer::reply(build_error_reply("empty command"));
     };
 
     // Command names are ASCII and case-insensitive; matched in place, no copy.
@@ -112,44 +125,66 @@ pub fn dispatch(
     if is(b"HELLO") {
         // Answering HELLO with an error is the supported way to stay on RESP2: the client
         // reads a command error as "this server predates HELLO" and continues.
-        return Reply::Error("ERR unknown command 'HELLO'".to_string());
+        return Answer::reply(Reply::Error("ERR unknown command 'HELLO'".to_string()));
     }
     if is(b"CLIENT") {
         // The client discards these results, so an error is as good as a status.
-        return Reply::Error("ERR unknown command 'CLIENT'".to_string());
+        return Answer::reply(Reply::Error("ERR unknown command 'CLIENT'".to_string()));
     }
     if is(b"PING") {
-        return Reply::Simple("PONG");
+        return Answer::reply(Reply::Simple("PONG"));
     }
-    if is(b"AUTH") || is(b"SELECT") || is(b"QUIT") {
-        return Reply::Simple("OK");
+    if is(b"AUTH") || is(b"SELECT") {
+        return Answer::reply(Reply::Simple("OK"));
+    }
+    if is(b"QUIT") {
+        return Answer {
+            reply: Reply::Simple("OK"),
+            close_after: true,
+        };
     }
 
     if is(b"EVALSHA") {
         if args.len() < EVALUATION_ARGUMENT_COUNT + 1 {
-            return error_reply("wrong number of arguments for 'evalsha'");
+            return Answer::reply(build_error_reply("wrong number of arguments for 'evalsha'"));
         }
-        if !scripts.is_known(&args[1]) {
+        if !scripts.is_known(args[1]) {
             // Provokes the client into resending the source, which is what lets the
             // store verify the caller's algorithm before serving its digest.
-            return Reply::Error("NOSCRIPT No matching script. Please use EVAL.".to_string());
+            return Answer::reply(Reply::Error(
+                "NOSCRIPT No matching script. Please use EVAL.".to_string(),
+            ));
         }
-        return evaluate_bucket(store, &args[2..], now);
+        return Answer::reply(evaluate_bucket(store, &args[2..], now));
     }
 
     if is(b"EVAL") {
         if args.len() < EVALUATION_ARGUMENT_COUNT + 1 {
-            return error_reply("wrong number of arguments for 'eval'");
+            return Answer::reply(build_error_reply("wrong number of arguments for 'eval'"));
         }
-        match scripts.register_source(&args[1]) {
-            RegistrationOutcome::Matched(_)
+        match scripts.register_source(args[1]) {
+            RegistrationOutcome::Matched {
+                revision,
+                first_seen: true,
+            } => {
+                let (event_id, event_name) = log_events::SCRIPT_REGISTERED;
+                tracing::info!(
+                    event_id,
+                    event_name,
+                    revision,
+                    "caller script matches a pinned text; its digest is now served directly"
+                );
+            }
+            RegistrationOutcome::Matched {
+                first_seen: false, ..
+            }
             | RegistrationOutcome::Diverged { first_seen: false } => {}
             RegistrationOutcome::Diverged { first_seen: true } => {
                 let (event_id, event_name) = log_events::SCRIPT_DIVERGED;
                 tracing::error!(
                     event_id,
                     event_name,
-                    digest = %crate::script::compute_digest(&args[1]),
+                    digest = %crate::script::compute_digest(args[1]),
                     "caller script differs from the pinned text; bucket semantics may have drifted"
                 );
             }
@@ -158,18 +193,18 @@ pub fn dispatch(
                 tracing::warn!(
                     event_id,
                     event_name,
-                    digest = %crate::script::compute_digest(&args[1]),
+                    digest = %crate::script::compute_digest(args[1]),
                     "another unrecognised script; served, but not remembered"
                 );
             }
         }
-        return evaluate_bucket(store, &args[2..], now);
+        return Answer::reply(evaluate_bucket(store, &args[2..], now));
     }
 
-    Reply::Error(format!(
+    Answer::reply(Reply::Error(format!(
         "ERR unknown command '{}'",
         String::from_utf8_lossy(name).to_ascii_uppercase()
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -182,6 +217,19 @@ mod tests {
 
     fn args_of(parts: &[&str]) -> Vec<Vec<u8>> {
         parts.iter().map(|part| part.as_bytes().to_vec()).collect()
+    }
+
+    fn slices(args: &[Vec<u8>]) -> Vec<&[u8]> {
+        args.iter().map(Vec::as_slice).collect()
+    }
+
+    fn answer(
+        store: &BucketStore,
+        scripts: &ScriptRegistry,
+        args: &[Vec<u8>],
+        now: Instant,
+    ) -> Reply {
+        dispatch(store, scripts, &slices(args), now).reply
     }
 
     fn evaluation_args(command: &str, script_or_digest: &str) -> Vec<Vec<u8>> {
@@ -211,7 +259,7 @@ mod tests {
     fn hello_is_refused_so_the_client_stays_on_resp2() {
         let (store, scripts, now) = fixtures();
 
-        let reply = dispatch(&store, &scripts, &args_of(&["HELLO", "3"]), now);
+        let reply = answer(&store, &scripts, &args_of(&["HELLO", "3"]), now);
 
         assert!(matches!(reply, Reply::Error(message) if message.contains("HELLO")));
     }
@@ -221,7 +269,7 @@ mod tests {
         let (store, scripts, now) = fixtures();
 
         assert_eq!(
-            dispatch(&store, &scripts, &args_of(&["PING"]), now),
+            answer(&store, &scripts, &args_of(&["PING"]), now),
             Reply::Simple("PONG")
         );
     }
@@ -230,7 +278,7 @@ mod tests {
     fn an_unknown_digest_asks_the_client_to_send_the_source() {
         let (store, scripts, now) = fixtures();
 
-        let reply = dispatch(
+        let reply = answer(
             &store,
             &scripts,
             &evaluation_args("EVALSHA", "0".repeat(40).as_str()),
@@ -244,32 +292,33 @@ mod tests {
     fn eval_registers_the_source_and_serves_the_bucket() {
         let (store, scripts, now) = fixtures();
 
-        let reply = dispatch(
+        let reply = answer(
             &store,
             &scripts,
             &evaluation_args("EVAL", PINNED_SCRIPT),
             now,
         );
 
-        let Reply::Array(items) = reply else {
-            panic!("expected the three-element script reply");
-        };
-        assert_eq!(items[0], Reply::Bulk("true".to_string()));
-        assert_eq!(items[1], Reply::Bulk("0".to_string()));
-        assert_eq!(items[2], Reply::Bulk("9".to_string()));
+        assert_eq!(
+            reply,
+            Reply::Bucket {
+                wait: 0.0,
+                tokens: 9.0
+            }
+        );
     }
 
     #[test]
     fn the_digest_is_served_directly_once_registered() {
         let (store, scripts, now) = fixtures();
-        dispatch(
+        answer(
             &store,
             &scripts,
             &evaluation_args("EVAL", PINNED_SCRIPT),
             now,
         );
 
-        let reply = dispatch(
+        let reply = answer(
             &store,
             &scripts,
             &evaluation_args(
@@ -279,18 +328,21 @@ mod tests {
             now,
         );
 
-        let Reply::Array(items) = reply else {
-            panic!("expected the three-element script reply");
-        };
         // The second request against the same key consumes another token.
-        assert_eq!(items[2], Reply::Bulk("8".to_string()));
+        assert_eq!(
+            reply,
+            Reply::Bucket {
+                wait: 0.0,
+                tokens: 8.0
+            }
+        );
     }
 
     #[test]
     fn an_unknown_command_is_an_error_not_a_disconnect() {
         let (store, scripts, now) = fixtures();
 
-        let reply = dispatch(&store, &scripts, &args_of(&["SUBSCRIBE", "channel"]), now);
+        let reply = answer(&store, &scripts, &args_of(&["SUBSCRIBE", "channel"]), now);
 
         assert!(matches!(reply, Reply::Error(message) if message.contains("SUBSCRIBE")));
     }
@@ -301,7 +353,7 @@ mod tests {
         let mut args = evaluation_args("EVAL", PINNED_SCRIPT);
         args[4] = b"not-a-number".to_vec();
 
-        let reply = dispatch(&store, &scripts, &args, now);
+        let reply = answer(&store, &scripts, &args, now);
 
         assert!(matches!(reply, Reply::Error(message) if message.contains("must be numbers")));
     }
@@ -312,9 +364,9 @@ mod tests {
         let mut args = evaluation_args("EVAL", PINNED_SCRIPT);
         args[6] = b"1e30".to_vec();
 
-        let reply = dispatch(&store, &scripts, &args, now);
+        let reply = answer(&store, &scripts, &args, now);
 
-        assert!(matches!(reply, Reply::Array(_)), "got {reply:?}");
+        assert!(matches!(reply, Reply::Bucket { .. }), "got {reply:?}");
     }
 
     #[test]
@@ -322,7 +374,7 @@ mod tests {
         let (store, scripts, now) = fixtures();
 
         assert_eq!(
-            dispatch(&store, &scripts, &args_of(&["ping"]), now),
+            answer(&store, &scripts, &args_of(&["ping"]), now),
             Reply::Simple("PONG")
         );
     }
@@ -331,7 +383,17 @@ mod tests {
     fn a_non_finite_wait_is_rendered_as_a_rejection_not_an_admission() {
         // Only a degenerate limit can produce it, but the caller must then read "wait
         // longer than anything acceptable", never zero.
-        assert_eq!(format_number(f64::INFINITY), f64::MAX.to_string());
-        assert_eq!(format_number(0.0), "0");
+        assert_eq!(pin_finite(f64::INFINITY), f64::MAX);
+        assert_eq!(pin_finite(0.0), 0.0);
+    }
+
+    #[test]
+    fn quit_is_answered_and_then_closes_the_connection() {
+        let (store, scripts, now) = fixtures();
+
+        let answer = dispatch(&store, &scripts, &slices(&args_of(&["QUIT"])), now);
+
+        assert_eq!(answer.reply, Reply::Simple("OK"));
+        assert!(answer.close_after);
     }
 }

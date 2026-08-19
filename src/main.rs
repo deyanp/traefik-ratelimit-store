@@ -10,13 +10,6 @@ use traefik_ratelimit_store::script::ScriptRegistry;
 use traefik_ratelimit_store::store::BucketStore;
 use traefik_ratelimit_store::{log_events, logging, mesh, server};
 
-/// How long to keep serving after readiness starts failing.
-///
-/// Long enough for the orchestrator to notice and withdraw this replica from its
-/// endpoints. Exiting before that would drop connections the orchestrator is still
-/// sending, which is the failure the grace period exists to avoid.
-const DRAIN_PERIOD: Duration = Duration::from_secs(5);
-
 /// Reclaims expired entries on a timer, so memory is returned whether or not traffic
 /// keeps arriving. One task for the process, living as long as the store does.
 async fn run_sweeper(store: Arc<BucketStore>) {
@@ -29,10 +22,12 @@ async fn run_sweeper(store: Arc<BucketStore>) {
 
 /// Turns a termination signal into an orderly withdrawal.
 ///
-/// Readiness fails first and the process keeps serving, so the orchestrator stops sending
-/// new connections while this replica finishes the ones it holds. Only then does it exit.
-/// A replica that exits immediately drops requests that were already in flight toward it.
-async fn drain_on_termination(health: Arc<Health>) {
+/// Readiness fails first and the process keeps serving for `drain_period`, so the
+/// orchestrator stops sending new connections while this replica finishes the ones it
+/// holds. Only then does it exit. A replica that exits immediately drops requests that
+/// were already in flight toward it. The period must be long enough for the withdrawal
+/// to propagate — and shorter than the orchestrator's termination grace period.
+async fn drain_on_termination(health: Arc<Health>, drain_period: Duration) {
     let mut terminate = match tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     ) {
@@ -43,18 +38,20 @@ async fn drain_on_termination(health: Arc<Health>) {
         }
     };
 
+    // Either signal starts the drain. A handler that could not be installed resolves
+    // immediately with an error, which must not be mistaken for the signal itself.
     tokio::select! {
         _ = terminate.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
+        Ok(()) = tokio::signal::ctrl_c() => {}
     }
 
     health.begin_draining();
     tracing::info!(
-        drain_seconds = DRAIN_PERIOD.as_secs(),
+        drain_seconds = drain_period.as_secs_f64(),
         "termination requested; failing readiness and draining"
     );
 
-    tokio::time::sleep(DRAIN_PERIOD).await;
+    tokio::time::sleep(drain_period).await;
     tracing::info!("drained; exiting");
     std::process::exit(0);
 }
@@ -74,7 +71,10 @@ async fn main() {
         shards = app_env.store.shard_count,
         entries_per_shard = app_env.store.capacity_per_shard,
         total_entries = app_env.store.shard_count * app_env.store.capacity_per_shard,
-        approximate_bytes = app_env.store.shard_count * app_env.store.capacity_per_shard * 400,
+        table_bytes = traefik_ratelimit_store::memory_budget::compute_table_bytes(
+            app_env.store.capacity_per_shard,
+            app_env.store.shard_count,
+        ),
         "entry ceiling sized against the memory budget"
     );
 
@@ -82,7 +82,7 @@ async fn main() {
     let scripts = Arc::new(ScriptRegistry::new());
     let health = Arc::new(Health::new(app_env.listen_address.clone()));
 
-    tokio::spawn(drain_on_termination(health.clone()));
+    tokio::spawn(drain_on_termination(health.clone(), app_env.drain_period));
 
     // Every task here must run for the life of the process. They are supervised together:
     // a sweeper that has died leaves memory to grow, a publisher that has died leaves the
@@ -105,7 +105,13 @@ async fn main() {
     // Serving the protocol is this process's whole job, so a failure here is fatal and
     // the orchestrator should replace the pod rather than leave it running dead.
     tokio::select! {
-        served = server::run(store, scripts, &app_env.listen_address) => {
+        served = server::run(
+            store,
+            scripts,
+            &app_env.listen_address,
+            app_env.max_connections,
+            app_env.connection_idle_timeout,
+        ) => {
             if let Err(error) = served {
                 tracing::error!(error = %error, "{} stopped", app_env.app_name);
             }

@@ -17,6 +17,12 @@ pub struct AppEnv {
     pub replica_id: String,
     /// Address the rate-limit protocol listener binds to.
     pub listen_address: String,
+    /// Most protocol connections served at once; one beyond that is refused.
+    pub max_connections: usize,
+    /// A protocol connection that sends nothing for this long is closed.
+    pub connection_idle_timeout: Duration,
+    /// How long to keep serving after readiness starts failing on termination.
+    pub drain_period: Duration,
     /// Address the peer endpoint binds to.
     pub peer_listen_address: String,
     /// Either a DNS name resolving to every peer, or a comma-separated list of addresses.
@@ -137,7 +143,7 @@ impl AppEnv {
         let budget_bytes = memory_budget::resolve_budget_bytes(budget_mb);
         let capacity_per_shard = read_optional(env_vars, "STORE_CAPACITY_PER_SHARD")
             .map(|_| read_usize(env_vars, "STORE_CAPACITY_PER_SHARD", 0))
-            .unwrap_or_else(|| memory_budget::entries_per_shard(budget_bytes, shard_count));
+            .unwrap_or_else(|| memory_budget::derive_entries_per_shard(budget_bytes, shard_count));
         require_positive("STORE_CAPACITY_PER_SHARD", capacity_per_shard as u128);
 
         let sweep_interval = read_duration_millis(env_vars, "STORE_SWEEP_INTERVAL_MS", 1_000);
@@ -161,10 +167,25 @@ impl AppEnv {
         let peer_max_keys_per_report = read_usize(env_vars, "PEER_MAX_KEYS_PER_REPORT", 10_000);
         require_positive("PEER_MAX_KEYS_PER_REPORT", peer_max_keys_per_report as u128);
 
+        let max_connections = read_usize(env_vars, "MAX_CONNECTIONS", 4_096);
+        require_positive("MAX_CONNECTIONS", max_connections as u128);
+        // The caller's own idle limit is thirty minutes; closing sooner would make it
+        // reconnect for nothing.
+        let connection_idle_timeout =
+            read_duration_millis(env_vars, "CONNECTION_IDLE_TIMEOUT_MS", 30 * 60 * 1_000);
+        require_positive(
+            "CONNECTION_IDLE_TIMEOUT_MS",
+            connection_idle_timeout.as_millis(),
+        );
+        let drain_period = read_duration_millis(env_vars, "DRAIN_PERIOD_MS", 5_000);
+
         Self {
             app_name: read_or_default(env_vars, "APPNAME", "traefik-ratelimit-store"),
             replica_id,
             listen_address: read_or_default(env_vars, "LISTEN_ADDRESS", "0.0.0.0:6379"),
+            max_connections,
+            connection_idle_timeout,
+            drain_period,
             peer_listen_address: read_or_default(env_vars, "PEER_LISTEN_ADDRESS", "0.0.0.0:8080"),
             peer_endpoint,
             peer_publish_interval,
@@ -189,6 +210,9 @@ mod tests {
         let env = AppEnv::create(&HashMap::new());
 
         assert_eq!(env.listen_address, "0.0.0.0:6379");
+        assert_eq!(env.max_connections, 4_096);
+        assert_eq!(env.connection_idle_timeout, Duration::from_secs(30 * 60));
+        assert_eq!(env.drain_period, Duration::from_secs(5));
         assert_eq!(env.peer_publish_interval, Duration::from_millis(150));
         assert_eq!(env.store.shard_count, 16);
         assert!(env.peer_endpoint.is_empty());
@@ -223,8 +247,9 @@ mod tests {
 
         // Whatever it derives must fit inside the budget it derived from — the property
         // that was violated when the two were configured separately.
-        let worst_case = env.store.capacity_per_shard * env.store.shard_count * 400;
-        assert!(worst_case < 128 * 1024 * 1024, "{worst_case} bytes");
+        let allocated =
+            memory_budget::compute_table_bytes(env.store.capacity_per_shard, env.store.shard_count);
+        assert!(allocated <= 64 * 1024 * 1024, "{allocated} bytes");
         assert!(env.store.capacity_per_shard > 1_000);
     }
 

@@ -31,7 +31,9 @@ impl KeyHash {
     }
 
     fn shard_index(&self, shard_count: usize) -> usize {
-        (self.0 % shard_count as u128) as usize
+        // The digest is uniform, so any 64 bits of it pick a shard as well as all 128
+        // would — and a 64-bit remainder is one instruction where a 128-bit one is a call.
+        ((self.0 >> 64) as u64 % shard_count as u64) as usize
     }
 
     /// The wire form, because a JSON map key must be a string.
@@ -52,8 +54,8 @@ pub struct StoreConfig {
     /// Hard entry ceiling per shard. A backstop, not the mechanism.
     ///
     /// Derived from the memory budget at startup (see `memory_budget`), because the
-    /// ceiling and the container's memory limit are one decision: an entry costs a few
-    /// hundred bytes once the map has grown, so a ceiling above the limit means the
+    /// ceiling and the container's memory limit are one decision: each shard's table is
+    /// allocated for this ceiling up front, so a ceiling above the limit means the
     /// process is killed before the trim that exists to prevent that ever runs.
     pub capacity_per_shard: usize,
     /// How often the background sweeper reclaims expired entries.
@@ -86,6 +88,21 @@ struct Entry {
     unpublished: u32,
 }
 
+/// What one slot of a shard's table costs: the key, the entry, and the table's control
+/// byte. The store pre-sizes each shard for its ceiling, so a shard's table holds the next
+/// power of two above `ceiling × 8/7` slots and never grows; `memory_budget` uses this to
+/// turn the container's memory into a ceiling that fits.
+pub const BYTES_PER_SLOT: usize = std::mem::size_of::<(KeyHash, Entry)>() + 1;
+
+/// Slots the table allocates for a ceiling: the map's own growth policy, one power of two
+/// above seven-eighths load, so the figure the budget plans for is the figure allocated.
+pub fn count_slots_for(capacity: usize) -> usize {
+    if capacity < 8 {
+        return if capacity < 4 { 4 } else { 8 };
+    }
+    (capacity * 8 / 7).next_power_of_two()
+}
+
 /// This replica's admissions for one key since the last report, with what a peer needs
 /// to fold them into its own bucket.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -110,7 +127,10 @@ pub struct PeerAdmissions {
     pub ttl: Duration,
 }
 
+/// Padded to a cache line, so two shards' locks never share one: a lock taken on one
+/// core must not invalidate the neighbouring shard's line on another.
 #[derive(Debug)]
+#[repr(align(64))]
 struct Shard {
     entries: HashMap<KeyHash, Entry>,
 }
@@ -126,27 +146,45 @@ impl Shard {
 
     /// Last-resort trim when a shard is at capacity with live entries.
     ///
-    /// Drops the least recently active tenth. This should never run: reaching it means
+    /// Drops the least recently touched tenth. This should never run: reaching it means
     /// distinct keys are arriving faster than they expire, which is a capacity or a
     /// traffic anomaly rather than normal operation.
+    ///
+    /// Recency is the entry's expiry, which this process stamps from its own clock on
+    /// every touch — so a caller with a skewed clock cannot make its keys look fresh, and
+    /// the clock that decides eviction is the one that decides expiry.
     ///
     /// Selects the cut point rather than sorting. The shard's mutex is held throughout, so
     /// every request hashing here waits for it — and at capacity a full sort costs about
     /// two milliseconds, sixteen times the normal p99. Partitioning is linear and needs
-    /// only the boundary, since which particular entries go is not important.
-    fn trim_least_recently_active(&mut self) {
-        let mut activity: Vec<f64> = self
+    /// only the boundary, since which particular entries go is not important. Entries
+    /// tied at the boundary are dropped only up to the count, never all of them.
+    fn trim_least_recently_touched(&mut self) {
+        let mut expiries: Vec<Instant> = self
             .entries
             .values()
-            .map(|entry| entry.state.last)
+            .map(|entry| entry.expires_at)
             .collect();
 
-        let drop_count = (activity.len() / 10 + 1).min(activity.len());
-        let (_, cut, _) =
-            activity.select_nth_unstable_by(drop_count - 1, |left, right| left.total_cmp(right));
+        let drop_count = (expiries.len() / 10 + 1).min(expiries.len());
+        let (_, cut, _) = expiries.select_nth_unstable(drop_count - 1);
         let threshold = *cut;
 
-        self.entries.retain(|_, entry| entry.state.last > threshold);
+        let below = expiries
+            .iter()
+            .filter(|expiry| **expiry < threshold)
+            .count();
+        let mut ties_to_drop = drop_count - below;
+        self.entries.retain(|_, entry| {
+            if entry.expires_at < threshold {
+                return false;
+            }
+            if entry.expires_at == threshold && ties_to_drop > 0 {
+                ties_to_drop -= 1;
+                return false;
+            }
+            true
+        });
     }
 
     /// Makes room for one more key when the shard is at its ceiling.
@@ -163,7 +201,7 @@ impl Shard {
             return false;
         }
 
-        self.trim_least_recently_active();
+        self.trim_least_recently_touched();
         true
     }
 }
@@ -177,10 +215,14 @@ pub struct BucketStore {
 
 impl BucketStore {
     pub fn new(config: StoreConfig) -> Self {
+        // Sized to the ceiling up front. The ceiling is enforced before any insert, so the
+        // table never has to grow — and a table that never grows never rehashes under its
+        // shard's mutex with every request to that shard waiting. Only the control bytes
+        // are touched at construction; bucket memory is resident once it is used.
         let shards = (0..config.shard_count)
             .map(|_| {
                 Mutex::new(Shard {
-                    entries: HashMap::new(),
+                    entries: HashMap::with_capacity(config.capacity_per_shard),
                 })
             })
             .collect();
@@ -228,38 +270,48 @@ impl BucketStore {
     ) -> BucketOutcome {
         let mut shard = self.lock_shard(key);
 
-        // One probe for the common case. The ceiling is checked only for a key the shard
-        // does not hold, which is the only insert that can grow it.
-        let (previous, unpublished) = match shard.entries.get(&key) {
-            // An entry the sweeper has not reached yet must still read as absent.
-            Some(entry) if entry.expires_at > now => (Some(entry.state), entry.unpublished),
-            Some(_) => (None, 0),
-            None => {
-                if shard.make_room(self.config.capacity_per_shard, now) {
-                    self.warn_at_capacity(shard.entries.len());
-                }
-                (None, 0)
+        // The ceiling is checked only for a key the shard does not hold, which is the
+        // only insert that can grow it. Making room may evict, so it happens before the
+        // entry is taken.
+        if !shard.entries.contains_key(&key) && shard.make_room(self.config.capacity_per_shard, now)
+        {
+            self.warn_at_capacity(shard.entries.len());
+        }
+
+        // One probe for the common case: the key is held, and is updated in place.
+        match shard.entries.entry(key) {
+            MapEntry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                // An entry the sweeper has not reached yet must still read as absent.
+                let live = entry.expires_at > now;
+                let previous = live.then_some(entry.state);
+                let outcome = bucket::apply_request(previous, params);
+                let admitted = outcome.wait <= params.max_delay;
+
+                entry.state = outcome.state;
+                entry.expires_at = now + ttl;
+                entry.limit = params.limit;
+                entry.burst = params.burst;
+                // A caller told to wait longer than it will accept is rejected, and a
+                // rejected caller consumed nothing — so only an admission counts toward
+                // what peers are told.
+                let carried = if live { entry.unpublished } else { 0 };
+                entry.unpublished = carried.saturating_add(u32::from(admitted));
+                outcome
             }
-        };
-
-        let outcome = bucket::apply_request(previous, params);
-
-        // A caller told to wait longer than it will accept is rejected, and a rejected
-        // caller consumed nothing — so only an admission counts toward what peers are told.
-        let admitted = outcome.wait <= params.max_delay;
-
-        shard.entries.insert(
-            key,
-            Entry {
-                state: outcome.state,
-                expires_at: now + ttl,
-                limit: params.limit,
-                burst: params.burst,
-                unpublished: unpublished.saturating_add(u32::from(admitted)),
-            },
-        );
-
-        outcome
+            MapEntry::Vacant(vacant) => {
+                let outcome = bucket::apply_request(None, params);
+                let admitted = outcome.wait <= params.max_delay;
+                vacant.insert(Entry {
+                    state: outcome.state,
+                    expires_at: now + ttl,
+                    limit: params.limit,
+                    burst: params.burst,
+                    unpublished: u32::from(admitted),
+                });
+                outcome
+            }
+        }
     }
 
     /// Folds admissions a peer reports for `key` into this replica's own bucket.
@@ -785,22 +837,24 @@ mod tests {
         };
         let store = BucketStore::new(config);
 
-        // Distinct activity timestamps, so oldest and newest are unambiguous.
+        // Distinct touch times on this process's clock, so oldest and newest are
+        // unambiguous. The caller's timestamp is deliberately the same for every key: it
+        // must not be what decides eviction.
         for index in 0..100u32 {
             store.apply_request(
                 KeyHash::from_key(format!("k{index}").as_bytes()),
-                &params_at(REALISTIC_NOW + f64::from(index)),
+                &params_at(REALISTIC_NOW),
                 Duration::from_secs(600),
-                start,
+                start + Duration::from_millis(u64::from(index)),
             );
         }
 
         // The insert that tips the shard over its capacity triggers the trim.
         store.apply_request(
             KeyHash::from_key(b"newest"),
-            &params_at(REALISTIC_NOW + 1000.0),
+            &params_at(REALISTIC_NOW),
             Duration::from_secs(600),
-            start,
+            start + Duration::from_secs(1),
         );
 
         // The oldest went; the newest stayed. Which particular entries were dropped is not
@@ -810,14 +864,14 @@ mod tests {
             store
                 .apply_request(
                     KeyHash::from_key(b"k0"),
-                    &params_at(REALISTIC_NOW + 1001.0),
+                    &params_at(REALISTIC_NOW),
                     Duration::from_secs(600),
-                    start,
+                    start + Duration::from_secs(2),
                 )
                 .state
                 .tokens,
             BURST - 1.0,
-            "the least recently active entry should have been dropped"
+            "the least recently touched entry should have been dropped"
         );
     }
 
@@ -893,15 +947,18 @@ mod tests {
         let store = BucketStore::new(config);
         let busy = KeyHash::from_key(b"rate:mw:busy");
 
-        // A steady client, interleaved with a flood of keys seen once each.
+        // A steady client, interleaved with a flood of keys seen once each. Time advances
+        // on both clocks, so the flood keys are each touched once and the busy key always
+        // most recently.
         for index in 0..5_000u32 {
             let now = REALISTIC_NOW + f64::from(index) * 1_000.0;
-            store.apply_request(busy, &params_at(now), TTL, start);
+            let at = start + Duration::from_millis(u64::from(index) * 2);
+            store.apply_request(busy, &params_at(now), TTL, at);
             store.apply_request(
                 KeyHash::from_key(format!("rate:mw:flood-{index}").as_bytes()),
                 &params_at(now),
                 TTL,
-                start,
+                at + Duration::from_millis(1),
             );
         }
 
@@ -912,8 +969,12 @@ mod tests {
         // the flood evicts itself: a source seen once is the least recently active thing
         // in the shard, while a source still sending is the last thing to go. The client
         // worth limiting stays limited; the ones dropped were nowhere near their limit.
-        let outcome =
-            store.apply_request(busy, &params_at(REALISTIC_NOW + 5_000_000.0), TTL, start);
+        let outcome = store.apply_request(
+            busy,
+            &params_at(REALISTIC_NOW + 5_000_000.0),
+            TTL,
+            start + Duration::from_secs(10),
+        );
         assert!(
             outcome.state.tokens < BURST - 1.0,
             "the busy key was evicted and got a fresh bucket: {}",
@@ -922,8 +983,46 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_costs_what_the_layout_says() {
+        // The budget plans on this figure; a change to `Entry` shows up here first. The
+        // key is 16 bytes and 16-aligned, the entry 56, so the pair pads to 80.
+        assert_eq!(BYTES_PER_SLOT, 80 + 1, "bytes per slot");
+        // And the table is sized the way the map itself sizes it: the shipped ceiling per
+        // shard lands in a 16,384-slot table, and one more than seven-eighths of that
+        // would need the next power of two.
+        assert_eq!(count_slots_for(10_485), 16_384);
+        assert_eq!(count_slots_for(14_336), 16_384);
+        assert_eq!(count_slots_for(14_337), 32_768);
+    }
+
+    #[test]
     fn hashing_is_stable_and_distinguishes_keys() {
         assert_eq!(KeyHash::from_key(b"same"), KeyHash::from_key(b"same"));
         assert_ne!(KeyHash::from_key(b"one"), KeyHash::from_key(b"two"));
+    }
+
+    #[test]
+    fn the_capacity_trim_drops_a_tenth_even_when_every_entry_is_tied() {
+        // Every key touched at the same instant: the trim must still drop about a tenth,
+        // never the whole shard.
+        let start = Instant::now();
+        let config = StoreConfig {
+            shard_count: 1,
+            capacity_per_shard: 100,
+            sweep_interval: Duration::from_secs(1),
+        };
+        let store = BucketStore::new(config);
+
+        for index in 0..101u32 {
+            store.apply_request(
+                KeyHash::from_key(format!("k{index}").as_bytes()),
+                &params_at(REALISTIC_NOW),
+                Duration::from_secs(600),
+                start,
+            );
+        }
+
+        // 100 held, one more arrives: 11 go (a tenth plus one), the newcomer is added.
+        assert_eq!(store.len(), 90);
     }
 }

@@ -12,7 +12,8 @@
 //! silently served with stale semantics.
 
 use std::collections::HashSet;
-use std::sync::{LazyLock, RwLock};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use sha1::{Digest, Sha1};
 
@@ -127,10 +128,6 @@ pub const KNOWN_SCRIPTS: &[(&str, &str)] = &[
     ("v3.7-branch", PINNED_SCRIPT_SPACED_RETURN),
 ];
 
-/// The digest of [`PINNED_SCRIPT`], computed once.
-pub static PINNED_SCRIPT_DIGEST: LazyLock<String> =
-    LazyLock::new(|| compute_digest(PINNED_SCRIPT.as_bytes()));
-
 /// How many digests of *unrecognised* sources the registry will remember.
 ///
 /// A fleet part-way through an upgrade sends a handful of distinct texts at most. The
@@ -141,8 +138,12 @@ pub const MAX_DIVERGED_SCRIPTS: usize = 16;
 /// What happened when a caller sent script source for evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegistrationOutcome {
-    /// The source matches a known text; its digest is now recognised.
-    Matched(&'static str),
+    /// The source matches a known text; its digest is now recognised. `first_seen` is
+    /// true the first time this revision arrives, so it can be logged once.
+    Matched {
+        revision: &'static str,
+        first_seen: bool,
+    },
     /// The source matches nothing known. The request is still served with this store's
     /// arithmetic, because refusing would turn a caller upgrade into an outage — but the
     /// semantics may have drifted and the operator needs to know. `first_seen` is true
@@ -163,22 +164,58 @@ pub fn compute_digest(source: &[u8]) -> String {
     hex::encode(Sha1::digest(source))
 }
 
-#[derive(Debug, Default)]
-struct Registrations {
-    known: HashSet<String>,
-    /// How many of `known` are unrecognised texts, held against [`MAX_DIVERGED_SCRIPTS`].
-    diverged: usize,
+/// One of [`KNOWN_SCRIPTS`], with its digest precomputed and a flag that flips once the
+/// caller has sent the matching source.
+#[derive(Debug)]
+struct PinnedScript {
+    revision: &'static str,
+    text: &'static str,
+    digest: [u8; 40],
+    registered: AtomicBool,
 }
 
 /// The digests this store answers to.
-#[derive(Debug, Default)]
+///
+/// The pinned texts are checked without a lock: every request carries a digest, and the
+/// ones that matter are the handful known at compile time, so they are compared as bytes
+/// against a flag. Only digests of unrecognised texts live behind a lock, and that lock is
+/// taken only once one exists.
+#[derive(Debug)]
 pub struct ScriptRegistry {
-    registrations: RwLock<Registrations>,
+    pinned: Vec<PinnedScript>,
+    diverged: RwLock<HashSet<String>>,
+    /// How many unrecognised texts are registered, held against [`MAX_DIVERGED_SCRIPTS`]
+    /// and consulted before the lock so the common case never takes it.
+    diverged_count: AtomicUsize,
+}
+
+impl Default for ScriptRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ScriptRegistry {
     pub fn new() -> Self {
-        Self::default()
+        let pinned = KNOWN_SCRIPTS
+            .iter()
+            .map(|(revision, text)| {
+                let mut digest = [0u8; 40];
+                digest.copy_from_slice(compute_digest(text.as_bytes()).as_bytes());
+                PinnedScript {
+                    revision,
+                    text,
+                    digest,
+                    registered: AtomicBool::new(false),
+                }
+            })
+            .collect();
+
+        Self {
+            pinned,
+            diverged: RwLock::new(HashSet::new()),
+            diverged_count: AtomicUsize::new(0),
+        }
     }
 
     /// Whether `digest` has been registered by a prior evaluation.
@@ -186,47 +223,51 @@ impl ScriptRegistry {
     /// Deliberately empty at startup, so the first request provokes the source exchange
     /// that validates the caller's algorithm against the pinned one.
     pub fn is_known(&self, digest: &[u8]) -> bool {
+        if let Some(pinned) = self.pinned.iter().find(|pinned| pinned.digest == digest) {
+            return pinned.registered.load(Ordering::Acquire);
+        }
+
+        if self.diverged_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let Ok(digest) = std::str::from_utf8(digest) else {
             return false;
         };
-
-        self.registrations
+        self.diverged
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .known
             .contains(digest)
     }
 
     /// Registers the digest of `source` and reports whether it matched a known text.
     pub fn register_source(&self, source: &[u8]) -> RegistrationOutcome {
-        let digest = compute_digest(source);
-        let matched = KNOWN_SCRIPTS
+        if let Some(pinned) = self
+            .pinned
             .iter()
-            .find(|(_, known)| known.as_bytes() == source)
-            .map(|(revision, _)| *revision);
+            .find(|pinned| pinned.text.as_bytes() == source)
+        {
+            let first_seen = !pinned.registered.swap(true, Ordering::AcqRel);
+            return RegistrationOutcome::Matched {
+                revision: pinned.revision,
+                first_seen,
+            };
+        }
 
-        let mut registrations = self
-            .registrations
+        let digest = compute_digest(source);
+        let mut diverged = self
+            .diverged
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        match matched {
-            Some(revision) => {
-                registrations.known.insert(digest);
-                RegistrationOutcome::Matched(revision)
-            }
-            None if registrations.known.contains(&digest) => {
-                RegistrationOutcome::Diverged { first_seen: false }
-            }
-            None if registrations.diverged >= MAX_DIVERGED_SCRIPTS => {
-                RegistrationOutcome::Unregistered
-            }
-            None => {
-                registrations.known.insert(digest);
-                registrations.diverged += 1;
-                RegistrationOutcome::Diverged { first_seen: true }
-            }
+        if diverged.contains(&digest) {
+            return RegistrationOutcome::Diverged { first_seen: false };
         }
+        if diverged.len() >= MAX_DIVERGED_SCRIPTS {
+            return RegistrationOutcome::Unregistered;
+        }
+        diverged.insert(digest);
+        self.diverged_count.store(diverged.len(), Ordering::Release);
+        RegistrationOutcome::Diverged { first_seen: true }
     }
 }
 
@@ -250,7 +291,7 @@ mod tests {
     fn nothing_is_known_before_a_source_arrives() {
         let registry = ScriptRegistry::new();
 
-        assert!(!registry.is_known(PINNED_SCRIPT_DIGEST.as_bytes()));
+        assert!(!registry.is_known(compute_digest(PINNED_SCRIPT.as_bytes()).as_bytes()));
     }
 
     #[test]
@@ -259,8 +300,22 @@ mod tests {
 
         let outcome = registry.register_source(PINNED_SCRIPT.as_bytes());
 
-        assert_eq!(outcome, RegistrationOutcome::Matched("v3.7.1"));
-        assert!(registry.is_known(PINNED_SCRIPT_DIGEST.as_bytes()));
+        assert_eq!(
+            outcome,
+            RegistrationOutcome::Matched {
+                revision: "v3.7.1",
+                first_seen: true
+            }
+        );
+        assert!(registry.is_known(compute_digest(PINNED_SCRIPT.as_bytes()).as_bytes()));
+        // Registered once; every later arrival of the same text is routine.
+        assert_eq!(
+            registry.register_source(PINNED_SCRIPT.as_bytes()),
+            RegistrationOutcome::Matched {
+                revision: "v3.7.1",
+                first_seen: false
+            }
+        );
     }
 
     #[test]
@@ -270,9 +325,13 @@ mod tests {
 
             assert_eq!(
                 registry.register_source(source.as_bytes()),
-                RegistrationOutcome::Matched(revision),
+                RegistrationOutcome::Matched {
+                    revision,
+                    first_seen: true
+                },
                 "revision {revision} should be recognised"
             );
+            assert!(registry.is_known(compute_digest(source.as_bytes()).as_bytes()));
         }
     }
 
@@ -330,7 +389,10 @@ mod tests {
         // A known text is always registered, full or not.
         assert_eq!(
             registry.register_source(PINNED_SCRIPT.as_bytes()),
-            RegistrationOutcome::Matched("v3.7.1")
+            RegistrationOutcome::Matched {
+                revision: "v3.7.1",
+                first_seen: true
+            }
         );
     }
 

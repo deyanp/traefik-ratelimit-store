@@ -26,7 +26,7 @@ It is not a Redis server, and it does not execute Lua. Traefik ships its bucket 
 as a Lua script and addresses it by SHA-1; this store implements the same arithmetic
 natively and treats the digest as an identifier. The script source is compared, never run.
 
-Six commands are implemented. Everything else answers with an error.
+Eight command names are answered. Everything else answers with an error.
 
 | Command | Behaviour |
 |---|---|
@@ -34,6 +34,7 @@ Six commands are implemented. Everything else answers with an error.
 | `CLIENT` | Refused; the client discards the result |
 | `AUTH`, `SELECT` | `+OK` |
 | `PING` | `+PONG` |
+| `QUIT` | `+OK`, then the connection is closed |
 | `EVALSHA` | Serves a known digest, otherwise `NOSCRIPT` |
 | `EVAL` | Validates the source, registers its digest, serves |
 
@@ -94,6 +95,10 @@ Everything has a working default; nothing is required.
 | Variable | Default | Meaning |
 |---|---|---|
 | `LISTEN_ADDRESS` | `0.0.0.0:6379` | Where the protocol listener binds |
+| `MAX_CONNECTIONS` | `4096` | Protocol connections served at once; one more is refused |
+| `CONNECTION_IDLE_TIMEOUT_MS` | `1800000` | A protocol connection silent for this long is closed (the client's own idle limit is 30 minutes) |
+| `DRAIN_PERIOD_MS` | `5000` | How long to keep serving after readiness starts failing on `SIGTERM`; keep it above the readiness probe's period × threshold and below the termination grace period |
+| `TOKIO_WORKER_THREADS` | *(cores)* | Runtime worker threads, read by the runtime itself; the shipped manifest sets 4 |
 | `PEER_LISTEN_ADDRESS` | `0.0.0.0:8080` | Where the peer endpoint binds |
 | `PEER_ENDPOINT` | *(empty)* | DNS name resolving to all peers, or a comma-separated list. Empty means this replica counts alone |
 | `PEER_PUBLISH_INTERVAL_MS` | `150` | How often admissions are published to peers |
@@ -174,15 +179,15 @@ Measured on a laptop. Reproduce with the examples below.
 
 | concurrency | throughput | p50 | p99 |
 |---|---|---|---|
-| 1 | 24k/s | 34us | 129us |
-| 16 | 68k/s | 226us | 328us |
-| 100 | 52k/s | 1.6ms | 2.6ms |
-| 500 | 50k/s | 6.4ms | 16.7ms |
-| 1500 | 47k/s | 26.3ms | 37.6ms |
+| 1 | 27k/s | 33us | 67us |
+| 16 | 73k/s | 215us | 290us |
+| 100 | 71k/s | 1.4ms | 1.9ms |
+| 500 | 62k/s | 7.2ms | 9.8ms |
+| 1500 | 66k/s | 21.7ms | 24.1ms |
 
-Read that as a saturation curve, not a cost curve. Throughput plateaus around 50k/s from a
-hundred connections on, after which latency is queue wait rather than service time —
-Little's Law predicts 1500/47000 = 32ms against 26ms measured. The client shares the
+Read that as a saturation curve, not a cost curve. Throughput plateaus around 65-70k/s from
+sixteen connections on, after which latency is queue wait rather than service time —
+Little's Law predicts 1500/66000 = 23ms against 21.7ms measured. The client shares the
 machine with the store here, so the plateau is the *pair* saturating, not the store alone.
 
 Concurrency in that table means requests in flight, not connections open. A pool of
@@ -191,17 +196,20 @@ idle connections costs memory and nothing else; only concurrent requests queue. 
 which keeps the left of this table the operative part — and is also what makes pool
 exhaustion, rather than store latency, the thing to watch.
 
-At 1500 concurrent connections the store held peak RSS of **29.8MB** against the manifest's
-128Mi limit, about 18KB per connection, and completed all 75,000 requests without error.
+At 1500 concurrent connections the store held peak RSS of **22.9MB** against the manifest's
+128Mi limit, about 15KB per connection, and completed all 750,000 requests without error.
+Connections start with a 2KB read buffer that grows only if a command needs it, and one
+that goes silent for `CONNECTION_IDLE_TIMEOUT_MS` is closed, so idle pools stop costing
+even that.
 
 **The store's own operations** (`cargo run --release --example store_cost`):
 
 | Operation | Cost |
 |---|---|
-| `apply_request`, one key | 36ns |
-| `apply_request`, distinct keys | 184ns |
-| `sweep_expired`, 200k entries | 730us |
-| capacity trim, worst case | 558us |
+| `apply_request`, one key | 44ns |
+| `apply_request`, distinct keys | 170ns |
+| `sweep_expired`, 200k entries | 572us |
+| capacity trim, worst case | 540us |
 
 The store contributes tens of nanoseconds to a request that costs tens of microseconds end
 to end — almost all of the measured latency is socket and scheduling, not this code. The
@@ -237,39 +245,47 @@ credential — never exists at rest.
 a fixed 16 bytes and non-reversibility; one distinct source is still one entry. It does make
 each entry smaller: the key the proxy sends is `rate:<middleware>:<source>`, around 54 bytes
 for a realistic middleware name, so a 16-byte hash beats storing it raw — which would also
-cost a heap allocation and a pointer to chase on every lookup. Measured with
-`cargo run --release --example memory_per_key`:
+cost a heap allocation and a pointer to chase on every lookup. An entry is a 16-byte key,
+a 56-byte record and one control byte in an 81-byte table slot. Measured on Linux with
+`cargo run --release --example memory_per_key` and tables left to grow on their own:
 
 | active keys | store RSS | bytes/key | peer report |
 |---|---|---|---|
-| 100,000 | 17.5MB | 161 | 3.7MB |
-| 250,000 | 84MB | 337 | 9.2MB |
-| 500,000 | 184MB | 373 | 18.5MB |
-| 1,000,000 | 383MB | 390 | 37MB |
+| 100,000 | 12.4MB | 108 | 12.4MB |
+| 250,000 | 43MB | 170 | 31MB |
+| 1,000,000 | 168MB | 170 | 124MB |
+
+(170 is an 81-byte slot at the half-full table a doubling leaves behind. A macOS
+measurement reads more than twice that, because its allocator keeps the freed old tables
+resident; size against Linux.)
 
 **So the ceiling is derived, not configured.** The entry count and the memory limit are one
 decision, and an earlier version of this store set them apart — a 128Mi limit beside a
-ceiling of a million entries, about 383MB, so the process would have been killed at roughly
-350k keys while its own backstop still reported headroom.
+ceiling of a million entries, so the process would have been killed at a few hundred
+thousand keys while its own backstop still reported headroom.
 
 There is now nothing to keep in step. The store reads the container's memory limit from
 cgroup — a kernel facility, so it works the same under Kubernetes, Docker and systemd — and
-sizes itself, giving entries half the budget and leaving the rest for connection buffers.
-`STORE_MEMORY_BUDGET_MB` overrides the discovered limit, `STORE_CAPACITY_PER_SHARD`
+sizes itself: half the budget goes to the shard tables, the rest to connection buffers and
+the allocator. Each shard's table is allocated once, at the largest power of two of slots
+that fits its share, and filled to the seven-eighths the map allows — so the figure planned
+for is the figure allocated, and no table ever grows under a shard's lock while requests
+wait. `STORE_MEMORY_BUDGET_MB` overrides the discovered limit (the shipped manifest feeds it
+from the container's own limit through the Downward API), `STORE_CAPACITY_PER_SHARD`
 overrides the result, and neither is normally needed.
 
 It says what it chose, at startup:
 
 ```
 entry ceiling sized against the memory budget
-  shards=16 entries_per_shard=10485 total_entries=167760 approximate_bytes=67104000
+  shards=16 entries_per_shard=28672 total_entries=458752 table_bytes=42467328
 ```
 
-| memory limit | entries held | of which |
+| memory limit | entries held | tables |
 |---|---|---|
-| 128Mi | 167,760 | ~62MB |
-| 256Mi | 335,536 | ~125MB |
-| 512Mi | 671,088 | ~250MB |
+| 128Mi | 458,752 | 40.5MB |
+| 256Mi | 917,504 | 81MB |
+| 512Mi | 1,835,008 | 162MB |
 
 If your distinct-source count exceeds the middle column, raise the container limit; the
 ceiling follows on its own.
