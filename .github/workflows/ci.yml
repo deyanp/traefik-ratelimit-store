@@ -12,7 +12,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -36,19 +36,22 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Advisories
         # Every dependency in Cargo.lock against the RustSec database. A known
         # vulnerability in the tree fails the build; the lockfile is what ships.
-        uses: rustsec/audit-check@v2
+        # Pinned to a commit, not @v2: the newest release (v2.0.0) still declares
+        # node20, and the only change since it is the node24 bump in this commit
+        # (dist/ is byte-identical). Move back to a tag once one carries the bump.
+        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2.0.0 + node24
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build the image
         # Not pushed. Proving the image builds is the point; publishing is a release
