@@ -52,6 +52,13 @@ metadata:
     app: traefik-ratelimit-store
 spec:
   replicas: 3
+  # Replace in place rather than surging a fourth pod: counters are disposable and the
+  # PodDisruptionBudget keeps two replicas serving, so a rollout should not need a free
+  # scheduling slot the size of another replica to make progress.
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: traefik-ratelimit-store
@@ -143,12 +150,15 @@ spec:
           resources:
             # Memory request equals the limit, so the pod is never the one evicted under
             # node pressure — the proxy answers any store error with a 500. The CPU request
-            # reflects what the measured load actually needs; without it the scheduler
-            # weights this pod as if it were idle when a node is contended. No CPU limit,
-            # deliberately: CFS throttling is what turns a busy replica into tail latency.
+            # is a floor, not a cap: with no CPU limit the store bursts to whatever the
+            # node has free, and the request only decides its weight when the node is
+            # contended. 150m schedules three replicas onto small shared nodes; raise it
+            # toward a full core per replica when a measured production load justifies
+            # reserving that much. No CPU limit, deliberately: CFS throttling is what
+            # turns a busy replica into tail latency.
             requests:
               memory: "128Mi"
-              cpu: "500m"
+              cpu: "150m"
             limits:
               memory: "128Mi"
           # Readiness answers for the RESP port by connecting to it, so a replica whose
