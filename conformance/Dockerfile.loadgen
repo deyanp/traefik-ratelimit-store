@@ -1,0 +1,58 @@
+# The in-cluster load generator: the `latency` example, packaged to run as a pod so a
+# load test measures the store over the cluster's own network rather than through a
+# port-forward. Used for the heavy-load runs (10M requests at ~190k req/s against three
+# replicas on a 2-CPU node); kept here so they can be repeated.
+#
+# Build and push to the cluster's registry, then run as a bare pod:
+#
+#   docker build -f conformance/Dockerfile.loadgen -t <registry>/rlstore-loadgen:<tag> .
+#   docker push <registry>/rlstore-loadgen:<tag>
+#   kubectl run rlstore-load --image=<registry>/rlstore-loadgen:<tag> \
+#       --labels=rlstore-loadtest=true --restart=Never -- \
+#       traefik-ratelimit-store.default.svc.cluster.local:6379 800 12500
+#   kubectl logs rlstore-load   # throughput and percentiles, once Succeeded
+#
+# Two lessons are baked into that invocation:
+#
+#   - The store's NetworkPolicy admits only Traefik to the protocol port, so where the
+#     CNI enforces it the load pod is refused. Grant the label above a temporary,
+#     additive policy for the duration of the test — policies OR together, so the
+#     shipped one stays untouched:
+#
+#       kubectl apply -f - <<'POLICY'
+#       apiVersion: networking.k8s.io/v1
+#       kind: NetworkPolicy
+#       metadata: { name: rlstore-loadtest, namespace: default }
+#       spec:
+#         podSelector: { matchLabels: { app: traefik-ratelimit-store } }
+#         policyTypes: ["Ingress"]
+#         ingress:
+#           - from: [ { podSelector: { matchLabels: { rlstore-loadtest: "true" } } } ]
+#             ports: [ { protocol: TCP, port: 6379 } ]
+#       POLICY
+#
+#     and delete it afterwards.
+#
+#   - Never label the pod with a selector some controller owns (`app: traefik`,
+#     `app: traefik-ratelimit-store`): a controller adopts a matching bare pod and
+#     deletes it on sight, which looks like the pod never ran.
+#
+# Base images are pinned by digest, matching the main Dockerfile; bump both together.
+
+FROM rust:1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY examples ./examples
+# The manifest declares a test target; a stub satisfies cargo without compiling tests.
+RUN mkdir -p tests && echo 'fn main() {}' > tests/main.rs \
+    && cargo build --release --example latency --locked
+
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
+
+COPY --from=build /src/target/release/examples/latency /usr/local/bin/latency
+
+USER nonroot
+ENTRYPOINT ["/usr/local/bin/latency"]

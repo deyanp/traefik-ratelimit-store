@@ -430,6 +430,12 @@ PASSED: memory and descriptors plateaued under sustained churn
 The proxy answers any store error with a 500, so a rollout that drops connections shows up
 as 500s rather than as a blip. Needs a cluster from `run.sh --keepCluster true`.
 
+**`conformance/Dockerfile.loadgen`** — the latency example packaged to run as a pod, for
+load-testing a deployed store over the cluster's own network. Its header is the runbook,
+including the NetworkPolicy exception the load pod needs. Measured against three replicas
+on a shared 2-CPU node: 10M requests at 192k requests/s, p50 1.8ms, p99 27.8ms, ~310m CPU
+and 8MiB per replica, nothing dropped.
+
 ```
  590 429
  310 200
