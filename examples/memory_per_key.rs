@@ -24,10 +24,11 @@ fn rss_kb() -> u64 {
 
 fn main() {
     let start = Instant::now();
-    // Room for every milestone: the default ceiling is sized for tests, and at the ceiling
-    // each insert trims a tenth of a shard, so the loop below would never reach 250k.
+    // Room for the last milestone — and not more: the tables are allocated for the
+    // ceiling up front, so what this measures is the shipped story for a store sized to
+    // hold a million keys.
     let store = BucketStore::new(StoreConfig {
-        capacity_per_shard: 1 << 20,
+        capacity_per_shard: 64 * 1024,
         ..StoreConfig::default()
     });
     let params = BucketParams {
@@ -59,12 +60,11 @@ fn main() {
             ((now - base) * 1024) / store.len().max(1) as u64
         );
     }
-    // Report size: one line per key touched since the last report, as JSON.
+    // Report size: one 48-byte record per key touched since the last report.
     let lines = store.collect_report(usize::MAX, start);
-    let report = traefik_ratelimit_store::peers::PeerReport::new("r".into(), &lines);
     println!(
-        "peer report for {} keys: {} bytes JSON",
+        "peer report for {} keys: {} bytes",
         lines.len(),
-        serde_json::to_string(&report).unwrap().len()
+        traefik_ratelimit_store::peers::encode_report("r", &lines).len()
     );
 }

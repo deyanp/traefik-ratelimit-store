@@ -22,16 +22,11 @@ use crate::app_env::AppEnv;
 use crate::errors::TechnicalError;
 use crate::health::Health;
 use crate::log_events;
-use crate::peers::{self, PeerReport};
+use crate::peers;
 use crate::store::BucketStore;
 
 /// Where a replica accepts its peers' reports.
 const REPORT_PATH: &str = "/peer-report";
-
-/// Generous upper bound on one serialised report line, used to size the body limit from
-/// the configured key cap so a stranger cannot make this replica buffer more than a peer
-/// could legitimately send.
-const BYTES_PER_REPORT_LINE: usize = 160;
 
 #[derive(Clone)]
 struct PeerEndpointState {
@@ -89,15 +84,9 @@ struct Delivery {
 async fn publish_once(
     client: &reqwest::Client,
     peers: &[String],
-    report: &PeerReport,
+    body: Bytes,
     shared_secret: &str,
 ) -> Delivery {
-    // Serialised once; each delivery shares the bytes.
-    let body = match serde_json::to_vec(report) {
-        Ok(body) => Bytes::from(body),
-        Err(_) => return Delivery::default(),
-    };
-
     // Spawned rather than awaited in turn, so one slow peer cannot delay the others.
     // Each task owns its inputs, and the client's timeout bounds how long it can linger.
     let mut deliveries = tokio::task::JoinSet::new();
@@ -110,7 +99,7 @@ async fn publish_once(
         deliveries.spawn(async move {
             let mut request = client
                 .post(&url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                 .body(body);
             if !secret.is_empty() {
                 request = request.bearer_auth(secret);
@@ -228,8 +217,9 @@ pub async fn run_publisher(store: Arc<BucketStore>, app_env: AppEnv) {
             continue;
         }
 
-        let report = PeerReport::new(app_env.replica_id.clone(), &lines);
-        let delivery = publish_once(&client, &peers, &report, &app_env.peer_shared_secret).await;
+        // Rendered once; each delivery shares the bytes.
+        let body = Bytes::from(peers::encode_report(&app_env.replica_id, &lines));
+        let delivery = publish_once(&client, &peers, body, &app_env.peer_shared_secret).await;
         health.note_delivery(peers.len(), delivery);
     }
 }
@@ -283,24 +273,18 @@ async fn receive_report(
         return StatusCode::UNAUTHORIZED;
     }
 
-    let report: PeerReport = match serde_json::from_slice(&body) {
-        Ok(report) => report,
+    let admissions = match peers::decode_report(&body, &state.replica_id, state.max_keys_per_report)
+    {
+        Ok(admissions) => admissions,
         Err(error) => {
             let (event_id, event_name) = log_events::PEER_REPORT_REFUSED;
-            tracing::debug!(event_id, event_name, error = %error, "malformed peer report");
-            return StatusCode::BAD_REQUEST;
+            tracing::debug!(event_id, event_name, error = %error, "peer report refused");
+            return match error {
+                peers::ReportError::TooManyKeys(_) => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::BAD_REQUEST,
+            };
         }
     };
-
-    let admissions =
-        match peers::decode_report(report, &state.replica_id, state.max_keys_per_report) {
-            Ok(admissions) => admissions,
-            Err(error) => {
-                let (event_id, event_name) = log_events::PEER_REPORT_REFUSED;
-                tracing::debug!(event_id, event_name, error = %error, "peer report refused");
-                return StatusCode::PAYLOAD_TOO_LARGE;
-            }
-        };
 
     let now = Instant::now();
     for (key, peer) in admissions {
@@ -355,9 +339,10 @@ pub async fn run_peer_endpoint(
         );
     }
 
-    // A report is bounded by PEER_MAX_KEYS_PER_REPORT, so anything far larger is not a
-    // peer. Rejecting it early keeps a stranger from making this replica allocate.
-    let body_limit = 1024 + app_env.peer_max_keys_per_report * BYTES_PER_REPORT_LINE;
+    // A report is bounded by PEER_MAX_KEYS_PER_REPORT records plus a small header, so
+    // anything larger is not a peer. Rejecting it early keeps a stranger from making this
+    // replica buffer more than a peer could legitimately send.
+    let body_limit = 1024 + app_env.peer_max_keys_per_report * peers::RECORD_BYTES;
 
     let app = Router::new()
         .route(REPORT_PATH, post(receive_report))

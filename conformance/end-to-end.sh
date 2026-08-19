@@ -101,10 +101,14 @@ if ! docker exec rlstore-traefik ls /etc/traefik/conf/dynamic.yml > /dev/null 2>
 fi
 
 echo "Waiting for the route to come up..."
+# Traefik answers before its file provider has loaded the router, so anything but the
+# route's own statuses — 200, or 429 once the probes have spent the burst — means keep
+# waiting. Breaking on the first non-000 reply used to let 404s leak into the measurement.
 for _ in $(seq 1 30); do
-    if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/)" != "000" ]; then
-        break
-    fi
+    status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/)
+    case "$status" in
+        200|429) break ;;
+    esac
     sleep 1
 done
 

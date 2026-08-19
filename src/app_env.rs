@@ -121,6 +121,13 @@ impl AppEnv {
         let replica_id = read_optional(env_vars, "REPLICA_ID")
             .or_else(|| read_optional(env_vars, "HOSTNAME"))
             .unwrap_or_else(|| "replica".to_string());
+        // The report's length prefix is one byte, and hostnames are far shorter anyway.
+        if replica_id.len() > crate::peers::MAX_REPLICA_ID_LENGTH {
+            panic!(
+                "REPLICA_ID must be at most {} bytes!",
+                crate::peers::MAX_REPLICA_ID_LENGTH
+            );
+        }
 
         let peer_endpoint = read_or_default(env_vars, "PEER_ENDPOINT", "");
         let peer_shared_secret = read_or_default(env_vars, "PEER_SHARED_SECRET", "");
@@ -399,6 +406,15 @@ mod tests {
         AppEnv::create(&HashMap::from([(
             "STORE_MEMORY_BUDGET_MB".to_string(),
             "128Mi".to_string(),
+        )]));
+    }
+
+    #[test]
+    #[should_panic(expected = "REPLICA_ID must be at most 255 bytes")]
+    fn an_implausibly_long_replica_id_is_refused_at_startup() {
+        AppEnv::create(&HashMap::from([(
+            "REPLICA_ID".to_string(),
+            "x".repeat(300),
         )]));
     }
 }

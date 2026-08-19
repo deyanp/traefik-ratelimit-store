@@ -36,13 +36,13 @@ impl KeyHash {
         ((self.0 >> 64) as u64 % shard_count as u64) as usize
     }
 
-    /// The wire form, because a JSON map key must be a string.
-    pub fn to_hex(self) -> String {
-        format!("{:032x}", self.0)
+    /// The wire form: the digest's own bytes, little-endian.
+    pub fn to_bytes(self) -> [u8; 16] {
+        self.0.to_le_bytes()
     }
 
-    pub fn from_hex(text: &str) -> Option<Self> {
-        u128::from_str_radix(text, 16).ok().map(Self)
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(u128::from_le_bytes(bytes))
     }
 }
 
@@ -413,13 +413,33 @@ impl BucketStore {
         }
 
         if report.len() > limit {
-            // Keep the busiest; hand the rest their counts back for a later report.
+            // Keep the busiest; hand the rest their counts back for a later report. The
+            // write-back is grouped by shard — sorted, then one lock per run — because
+            // under heavy load the deferred tail is most of the keyspace, and a lock per
+            // key would be hundreds of thousands of acquisitions per interval.
             report.select_nth_unstable_by(limit.saturating_sub(1), |left, right| {
                 right.admitted.cmp(&left.admitted)
             });
-            for deferred in report.drain(limit..) {
-                if let Some(entry) = self.lock_shard(deferred.key).entries.get_mut(&deferred.key) {
-                    entry.unpublished = entry.unpublished.saturating_add(deferred.admitted);
+            let mut deferred: Vec<(usize, KeyHash, u32)> = report
+                .drain(limit..)
+                .map(|line| {
+                    (
+                        line.key.shard_index(self.config.shard_count),
+                        line.key,
+                        line.admitted,
+                    )
+                })
+                .collect();
+            deferred.sort_unstable_by_key(|(shard_index, _, _)| *shard_index);
+
+            for run in deferred.chunk_by(|left, right| left.0 == right.0) {
+                let mut shard = self.shards[run[0].0]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for (_, key, admitted) in run {
+                    if let Some(entry) = shard.entries.get_mut(key) {
+                        entry.unpublished = entry.unpublished.saturating_add(*admitted);
+                    }
                 }
             }
         }
@@ -785,7 +805,7 @@ mod tests {
     fn a_key_hash_survives_its_wire_form() {
         let key = KeyHash::from_key(b"rate:mw:client");
 
-        assert_eq!(KeyHash::from_hex(&key.to_hex()), Some(key));
+        assert_eq!(KeyHash::from_bytes(key.to_bytes()), key);
     }
 
     #[test]

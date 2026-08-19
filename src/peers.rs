@@ -1,4 +1,4 @@
-//! What peers tell each other.
+//! What peers tell each other, as bytes on the wire.
 //!
 //! Replicas share **admissions**, not bucket state. Bucket state does not merge — taking
 //! the newest or the largest of two `(last, tokens)` pairs discards one replica's
@@ -12,67 +12,46 @@
 //! report once is the whole protocol: there is no table to reconcile and nothing to age
 //! out. A report that is lost costs its peers that interval's admissions, which is the
 //! same one-interval error the exchange cadence already allows.
+//!
+//! The encoding is a fixed binary record, not JSON: under heavy load a report carries
+//! thousands of keys several times a second to every peer, and at that volume the
+//! difference is real — 48 bytes per key against ~150 of JSON, and a decode that is a
+//! bounds check and a copy instead of a parse. One version byte leads, so a mismatched
+//! replica fails loudly instead of misreading:
+//!
+//! ```text
+//! [version u8] [replica_id_len u8] [replica_id bytes]
+//! then per key, little-endian, 48 bytes:
+//!   key      u128   16    admitted u32   4    last  f64  8
+//!   limit    f64     8    burst    f64   8    ttl   u32  4  (milliseconds)
+//! ```
 
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 use crate::store::{KeyHash, KeyReport, PeerAdmissions};
 
-/// Longest replica id accepted on the wire. Hostnames are far shorter; anything longer is
-/// not a peer.
-const MAX_REPLICA_ID_LENGTH: usize = 256;
+/// Refused on receipt if it does not match; bumped when the record layout changes.
+pub const FORMAT_VERSION: u8 = 1;
+
+/// One key's admissions on the wire.
+pub const RECORD_BYTES: usize = 48;
+
+/// Longest replica id the length prefix can carry. Startup refuses a longer one, so
+/// encoding never has to.
+pub const MAX_REPLICA_ID_LENGTH: usize = 255;
 
 /// Longest lifetime a peer may ask this replica to hold an entry for. The caller derives
 /// lifetimes of a few seconds from the rate; a day is far beyond anything legitimate.
 const MAX_REPORTED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// One key's admissions, as they travel.
-///
-/// The key is hexadecimal because it is a digest, not a string. `last`, `limit` and
-/// `burst` let the receiver fold the admissions into its own bucket as of the moment they
-/// happened, even for a key it has not seen itself.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct KeyAdmissions {
-    pub key: String,
-    pub admitted: u32,
-    pub last: f64,
-    pub limit: f64,
-    pub burst: f64,
-    pub ttl_ms: u64,
-}
-
-/// One replica's account of what it admitted since its previous report.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PeerReport {
-    pub replica_id: String,
-    pub keys: Vec<KeyAdmissions>,
-}
-
-impl PeerReport {
-    pub fn new(replica_id: String, lines: &[KeyReport]) -> Self {
-        Self {
-            replica_id,
-            keys: lines
-                .iter()
-                .map(|line| KeyAdmissions {
-                    key: line.key.to_hex(),
-                    admitted: line.admitted,
-                    last: line.last,
-                    limit: line.limit,
-                    burst: line.burst,
-                    ttl_ms: line.ttl.as_millis().try_into().unwrap_or(u64::MAX),
-                })
-                .collect(),
-        }
-    }
-}
-
 /// Why a report was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReportError {
-    /// The replica id is empty or longer than any hostname.
-    InvalidReplicaId,
+    /// The first byte names a format this replica does not speak.
+    UnknownVersion(u8),
+    /// The bytes do not parse as a report: truncated header, an id that is not UTF-8, or
+    /// a body that is not a whole number of records.
+    Malformed,
     /// More keys than this replica is prepared to fold from one report.
     TooManyKeys(usize),
 }
@@ -80,10 +59,49 @@ pub enum ReportError {
 impl std::fmt::Display for ReportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidReplicaId => write!(f, "replica id is empty or too long"),
+            Self::UnknownVersion(version) => write!(f, "unknown report format version {version}"),
+            Self::Malformed => write!(f, "report does not parse"),
             Self::TooManyKeys(count) => write!(f, "report carries {count} keys, over the limit"),
         }
     }
+}
+
+/// Renders a report: this replica's identity and what it admitted since the last one.
+///
+/// The id's length is validated at startup, so encoding cannot fail.
+pub fn encode_report(replica_id: &str, lines: &[KeyReport]) -> Vec<u8> {
+    debug_assert!(
+        !replica_id.is_empty() && replica_id.len() <= MAX_REPLICA_ID_LENGTH,
+        "replica id length is validated at startup"
+    );
+
+    let mut out = Vec::with_capacity(2 + replica_id.len() + lines.len() * RECORD_BYTES);
+    out.push(FORMAT_VERSION);
+    out.push(replica_id.len() as u8);
+    out.extend_from_slice(replica_id.as_bytes());
+
+    for line in lines {
+        out.extend_from_slice(&line.key.to_bytes());
+        out.extend_from_slice(&line.admitted.to_le_bytes());
+        out.extend_from_slice(&line.last.to_le_bytes());
+        out.extend_from_slice(&line.limit.to_le_bytes());
+        out.extend_from_slice(&line.burst.to_le_bytes());
+        let ttl_ms: u32 = line.ttl.as_millis().try_into().unwrap_or(u32::MAX);
+        out.extend_from_slice(&ttl_ms.to_le_bytes());
+    }
+
+    out
+}
+
+/// Reads a fixed-width little-endian field out of a record, advancing the cursor.
+///
+/// Infallible by construction: records are exact multiples of [`RECORD_BYTES`] and the
+/// field widths sum to it, which the compiler cannot see but the tests pin.
+fn take<const N: usize>(record: &[u8], cursor: &mut usize) -> [u8; N] {
+    let mut field = [0u8; N];
+    field.copy_from_slice(&record[*cursor..*cursor + N]);
+    *cursor += N;
+    field
 }
 
 /// Turns a received report into the admissions to fold, dropping lines that cannot be
@@ -93,46 +111,74 @@ impl std::fmt::Display for ReportError {
 /// since one loopback request per interval is cheaper than the machinery to avoid it, and
 /// it recognises the echo by its own id.
 ///
-/// A line with a non-finite number, a non-positive `limit`, or a malformed key is skipped
-/// rather than failing the report: one bad line should not discard its neighbours, and a
-/// skipped line only makes this replica more permissive for that key by one report.
+/// A record with a non-finite number, a non-positive `limit`, or nothing admitted is
+/// skipped rather than failing the report: one bad line should not discard its
+/// neighbours, and a skipped line only makes this replica more permissive for that key by
+/// one report.
 pub fn decode_report(
-    report: PeerReport,
+    bytes: &[u8],
     own_replica_id: &str,
     max_keys: usize,
 ) -> Result<Vec<(KeyHash, PeerAdmissions)>, ReportError> {
-    if report.replica_id.is_empty() || report.replica_id.len() > MAX_REPLICA_ID_LENGTH {
-        return Err(ReportError::InvalidReplicaId);
+    let [version, id_length, rest @ ..] = bytes else {
+        return Err(ReportError::Malformed);
+    };
+    if *version != FORMAT_VERSION {
+        return Err(ReportError::UnknownVersion(*version));
     }
-    if report.keys.len() > max_keys {
-        return Err(ReportError::TooManyKeys(report.keys.len()));
+    let id_length = usize::from(*id_length);
+    if id_length == 0 || rest.len() < id_length {
+        return Err(ReportError::Malformed);
     }
-    if report.replica_id == own_replica_id {
+
+    let (id, records) = rest.split_at(id_length);
+    let Ok(id) = std::str::from_utf8(id) else {
+        return Err(ReportError::Malformed);
+    };
+    if !records.len().is_multiple_of(RECORD_BYTES) {
+        return Err(ReportError::Malformed);
+    }
+    let count = records.len() / RECORD_BYTES;
+    if count > max_keys {
+        return Err(ReportError::TooManyKeys(count));
+    }
+    if id == own_replica_id {
         return Ok(Vec::new());
     }
 
-    Ok(report
-        .keys
-        .iter()
-        .filter_map(|line| {
-            let key = KeyHash::from_hex(&line.key)?;
-            let usable = line.admitted > 0
-                && line.last.is_finite()
-                && line.limit.is_finite()
-                && line.limit > 0.0
-                && line.burst.is_finite();
-            usable.then_some((
-                key,
-                PeerAdmissions {
-                    admitted: line.admitted,
-                    last: line.last,
-                    limit: line.limit,
-                    burst: line.burst,
-                    ttl: Duration::from_millis(line.ttl_ms).min(MAX_REPORTED_TTL),
-                },
-            ))
-        })
-        .collect())
+    let mut admissions = Vec::with_capacity(count);
+    for record in records.chunks_exact(RECORD_BYTES) {
+        let mut cursor = 0;
+        let key = KeyHash::from_bytes(take::<16>(record, &mut cursor));
+        let admitted = u32::from_le_bytes(take::<4>(record, &mut cursor));
+        let last = f64::from_le_bytes(take::<8>(record, &mut cursor));
+        let limit = f64::from_le_bytes(take::<8>(record, &mut cursor));
+        let burst = f64::from_le_bytes(take::<8>(record, &mut cursor));
+        let ttl_ms = u32::from_le_bytes(take::<4>(record, &mut cursor));
+        debug_assert_eq!(cursor, RECORD_BYTES);
+
+        let usable = admitted > 0
+            && last.is_finite()
+            && limit.is_finite()
+            && limit > 0.0
+            && burst.is_finite();
+        if !usable {
+            continue;
+        }
+
+        admissions.push((
+            key,
+            PeerAdmissions {
+                admitted,
+                last,
+                limit,
+                burst,
+                ttl: Duration::from_millis(u64::from(ttl_ms)).min(MAX_REPORTED_TTL),
+            },
+        ));
+    }
+
+    Ok(admissions)
 }
 
 #[cfg(test)]
@@ -141,33 +187,37 @@ mod tests {
 
     const LIMIT: f64 = 3.0 / 1_000_000.0;
 
-    fn line(key: KeyHash, admitted: u32) -> KeyAdmissions {
-        KeyAdmissions {
-            key: key.to_hex(),
+    fn line(key: KeyHash, admitted: u32) -> KeyReport {
+        KeyReport {
+            key,
             admitted,
             last: 1_787_000_000_000_000.0,
             limit: LIMIT,
             burst: 10.0,
-            ttl_ms: 2_000,
-        }
-    }
-
-    fn report_of(replica: &str, lines: Vec<KeyAdmissions>) -> PeerReport {
-        PeerReport {
-            replica_id: replica.to_string(),
-            keys: lines,
+            ttl: Duration::from_secs(2),
         }
     }
 
     #[test]
-    fn a_report_decodes_into_admissions_to_fold() {
+    fn a_record_costs_exactly_its_declared_width() {
         let key = KeyHash::from_key(b"rate:mw:client");
 
-        let decoded = decode_report(report_of("peer-a", vec![line(key, 5)]), "self", 100).unwrap();
+        let encoded = encode_report("peer-a", &[line(key, 5), line(key, 6)]);
+
+        assert_eq!(encoded.len(), 2 + "peer-a".len() + 2 * RECORD_BYTES);
+    }
+
+    #[test]
+    fn a_report_survives_the_round_trip() {
+        let key = KeyHash::from_key(b"rate:mw:client");
+
+        let decoded =
+            decode_report(&encode_report("peer-a", &[line(key, 5)]), "self", 100).unwrap();
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].0, key);
         assert_eq!(decoded[0].1.admitted, 5);
+        assert_eq!(decoded[0].1.last, 1_787_000_000_000_000.0);
         assert_eq!(decoded[0].1.limit, LIMIT);
         assert_eq!(decoded[0].1.burst, 10.0);
         assert_eq!(decoded[0].1.ttl, Duration::from_secs(2));
@@ -177,7 +227,7 @@ mod tests {
     fn a_replicas_own_echo_is_discarded() {
         let key = KeyHash::from_key(b"rate:mw:client");
 
-        let decoded = decode_report(report_of("self", vec![line(key, 9)]), "self", 100).unwrap();
+        let decoded = decode_report(&encode_report("self", &[line(key, 9)]), "self", 100).unwrap();
 
         assert!(decoded.is_empty());
     }
@@ -185,48 +235,60 @@ mod tests {
     #[test]
     fn an_oversized_report_is_refused() {
         let key = KeyHash::from_key(b"rate:mw:client");
-        let lines = (0..3).map(|_| line(key, 1)).collect();
+        let lines = [line(key, 1), line(key, 1), line(key, 1)];
 
         assert_eq!(
-            decode_report(report_of("peer-a", lines), "self", 2),
+            decode_report(&encode_report("peer-a", &lines), "self", 2),
             Err(ReportError::TooManyKeys(3))
         );
     }
 
     #[test]
-    fn an_implausible_replica_id_is_refused() {
+    fn a_foreign_version_is_refused_not_misread() {
+        let key = KeyHash::from_key(b"rate:mw:client");
+        let mut encoded = encode_report("peer-a", &[line(key, 1)]);
+        encoded[0] = 2;
+
         assert_eq!(
-            decode_report(report_of("", vec![]), "self", 100),
-            Err(ReportError::InvalidReplicaId)
-        );
-        assert_eq!(
-            decode_report(report_of(&"x".repeat(300), vec![]), "self", 100),
-            Err(ReportError::InvalidReplicaId)
+            decode_report(&encoded, "self", 100),
+            Err(ReportError::UnknownVersion(2))
         );
     }
 
     #[test]
-    fn lines_that_cannot_be_folded_safely_are_skipped() {
+    fn bytes_that_do_not_parse_are_refused() {
+        let key = KeyHash::from_key(b"rate:mw:client");
+        let whole = encode_report("peer-a", &[line(key, 1)]);
+
+        // Empty, truncated header, truncated id, and a torn record.
+        assert_eq!(decode_report(&[], "self", 100), Err(ReportError::Malformed));
+        assert_eq!(
+            decode_report(&[FORMAT_VERSION], "self", 100),
+            Err(ReportError::Malformed)
+        );
+        assert_eq!(
+            decode_report(&[FORMAT_VERSION, 10, b'x'], "self", 100),
+            Err(ReportError::Malformed)
+        );
+        assert_eq!(
+            decode_report(&whole[..whole.len() - 1], "self", 100),
+            Err(ReportError::Malformed)
+        );
+    }
+
+    #[test]
+    fn records_that_cannot_be_folded_safely_are_skipped() {
         let key = KeyHash::from_key(b"rate:mw:client");
         let mut zero_limit = line(key, 1);
         zero_limit.limit = 0.0;
         let mut non_finite = line(key, 1);
         non_finite.burst = f64::INFINITY;
-        let mut bad_key = line(key, 1);
-        bad_key.key = "not-hex".to_string();
-        let mut nothing_admitted = line(key, 0);
-        nothing_admitted.admitted = 0;
+        let nothing_admitted = line(key, 0);
 
         let decoded = decode_report(
-            report_of(
+            &encode_report(
                 "peer-a",
-                vec![
-                    zero_limit,
-                    non_finite,
-                    bad_key,
-                    nothing_admitted,
-                    line(key, 2),
-                ],
+                &[zero_limit, non_finite, nothing_admitted, line(key, 2)],
             ),
             "self",
             100,
@@ -241,21 +303,10 @@ mod tests {
     fn a_reported_lifetime_is_capped() {
         let key = KeyHash::from_key(b"rate:mw:client");
         let mut forever = line(key, 1);
-        forever.ttl_ms = u64::MAX;
+        forever.ttl = Duration::from_secs(u64::MAX);
 
-        let decoded = decode_report(report_of("peer-a", vec![forever]), "self", 100).unwrap();
+        let decoded = decode_report(&encode_report("peer-a", &[forever]), "self", 100).unwrap();
 
         assert_eq!(decoded[0].1.ttl, MAX_REPORTED_TTL);
-    }
-
-    #[test]
-    fn a_report_survives_a_round_trip_through_json() {
-        let key = KeyHash::from_key(b"rate:mw:client");
-        let report = report_of("peer-a", vec![line(key, 7)]);
-
-        let decoded: PeerReport =
-            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
-
-        assert_eq!(decoded, report);
     }
 }

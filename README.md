@@ -68,6 +68,14 @@ the `limit`/`burst` the caller sent, so the receiver folds it into its bucket as
 moment — refill up to then, subtract, done. Applying a report once is the whole protocol:
 there is no table to reconcile, no merge, and nothing to age out.
 
+On the wire a report is a version byte, the replica id, and one fixed 48-byte record per
+key — sized for heavy load, where a report carries thousands of keys several times a
+second to every peer. Measured at 10,000 keys: 480KB (JSON spelled the same report at
+~1.5MB), encoded in 27µs, decoded in 34µs — a bounds check and a copy, no parser — and
+folded into the receiving store in 371µs. Collecting the report from a store with 200,000
+keys touched in one interval costs 5.2ms on the sending side, once per interval, off the
+request path.
+
 Debiting the stored level — rather than offsetting each later decision by what peers
 reported recently — is what makes the limit hold under **sustained** traffic, not only
 across a burst. A decision-time offset leaves every replica refilling its own bucket at the
@@ -246,18 +254,21 @@ a fixed 16 bytes and non-reversibility; one distinct source is still one entry. 
 each entry smaller: the key the proxy sends is `rate:<middleware>:<source>`, around 54 bytes
 for a realistic middleware name, so a 16-byte hash beats storing it raw — which would also
 cost a heap allocation and a pointer to chase on every lookup. An entry is a 16-byte key,
-a 56-byte record and one control byte in an 81-byte table slot. Measured on Linux with
-`cargo run --release --example memory_per_key` and tables left to grow on their own:
+a 56-byte record and one control byte in an 81-byte table slot, and each shard's table is
+allocated for its ceiling up front — so a store's memory is decided by its ceiling, not by
+its moment-to-moment key count. Measured on Linux with
+`cargo run --release --example memory_per_key`, on a store sized to hold a million keys
+(two million slots, 163MB of tables):
 
-| active keys | store RSS | bytes/key | peer report |
-|---|---|---|---|
-| 100,000 | 12.4MB | 108 | 12.4MB |
-| 250,000 | 43MB | 170 | 31MB |
-| 1,000,000 | 168MB | 170 | 124MB |
+| filled | store RSS | peer report if every key is touched |
+|---|---|---|
+| 100,000 | 150MB | 4.8MB |
+| 250,000 | 163MB | 12MB |
+| 1,000,000 | 163.5MB | 48MB |
 
-(170 is an 81-byte slot at the half-full table a doubling leaves behind. A macOS
-measurement reads more than twice that, because its allocator keeps the freed old tables
-resident; size against Linux.)
+The RSS is the table allocation, nearly in full from the first hundred thousand keys:
+hashing scatters entries, so almost every page is touched early. What the budget buys is
+therefore known at startup — `table_bytes`, logged — and nothing grows afterwards.
 
 **So the ceiling is derived, not configured.** The entry count and the memory limit are one
 decision, and an earlier version of this store set them apart — a 128Mi limit beside a

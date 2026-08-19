@@ -327,11 +327,12 @@ Count sharing is right in both regimes and is far simpler.
 ### 7.2 Payload
 
 Each interval, every replica publishes what it admitted since its previous report, for the
-keys it touched:
+keys it touched. On the wire that is one version byte, the replica id length-prefixed, and
+a fixed 48-byte record per key, little-endian:
 
 ```
-replica_id,
-keys: [ { key_hash, admitted, last, limit, burst, ttl_ms } ]
+[version u8] [id_len u8] [replica_id]
+per key: key u128 | admitted u32 | last f64 | limit f64 | burst f64 | ttl_ms u32
 ```
 
 On receipt, per line, the receiver folds the admissions into its own bucket as of `last`:

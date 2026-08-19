@@ -13,16 +13,18 @@
 use std::time::{Duration, Instant};
 
 use traefik_ratelimit_store::bucket::BucketParams;
+use traefik_ratelimit_store::peers::{decode_report, encode_report};
 use traefik_ratelimit_store::store::{BucketStore, KeyHash, StoreConfig};
 
 const REALISTIC_NOW: f64 = 1_787_000_000_000_000.0;
 const TTL: Duration = Duration::from_secs(600);
 
-/// Room for every key these measurements insert. The default ceiling is sized for tests;
-/// measuring against it would time the capacity trim rather than the operation.
+/// Room for every key these measurements insert — and not more. The tables are allocated
+/// for the ceiling up front, so an oversized ceiling would measure walks over empty slots
+/// (and their page faults) rather than the operation.
 fn roomy_config() -> StoreConfig {
     StoreConfig {
-        capacity_per_shard: 1 << 20,
+        capacity_per_shard: 16 * 1024,
         ..StoreConfig::default()
     }
 }
@@ -124,6 +126,89 @@ fn measure_capacity_trim(start: Instant) {
     );
 }
 
+/// The report path at heavy load: 200k keys touched since the last report, capped to the
+/// 10k busiest — the whole path a publish interval pays, and what a receiving peer pays.
+fn measure_report_path(start: Instant) {
+    let store = BucketStore::new(roomy_config());
+    let count = 200_000;
+    for index in 0..count {
+        store.apply_request(
+            KeyHash::from_key(format!("rate:bench:{index}").as_bytes()),
+            &params(REALISTIC_NOW + index as f64),
+            TTL,
+            start,
+        );
+    }
+
+    let cap = 10_000;
+    let began = Instant::now();
+    let lines = store.collect_report(cap, start);
+    println!(
+        "{:<34} {:>9?}   ({count} touched keys, {} sent, rest deferred)",
+        "collect_report, capped",
+        began.elapsed(),
+        lines.len()
+    );
+
+    let began = Instant::now();
+    let body = encode_report("replica-bench", &lines);
+    println!(
+        "{:<34} {:>9?}   ({} keys, {} bytes)",
+        "encode_report",
+        began.elapsed(),
+        lines.len(),
+        body.len()
+    );
+
+    let began = Instant::now();
+    let admissions = decode_report(&body, "another-replica", usize::MAX).unwrap();
+    println!(
+        "{:<34} {:>9?}   ({} records)",
+        "decode_report",
+        began.elapsed(),
+        admissions.len()
+    );
+
+    let receiver = BucketStore::new(roomy_config());
+    let began = Instant::now();
+    for (key, peer) in admissions {
+        receiver.apply_peer_admissions(key, peer, start);
+    }
+    println!(
+        "{:<34} {:>9?}   (folded into the receiving store)",
+        "apply_peer_admissions x10k",
+        began.elapsed()
+    );
+
+    // The uncapped walk, for the shape where everything fits in one report.
+    let store = BucketStore::new(roomy_config());
+    for index in 0..count {
+        store.apply_request(
+            KeyHash::from_key(format!("rate:bench:{index}").as_bytes()),
+            &params(REALISTIC_NOW + index as f64),
+            TTL,
+            start,
+        );
+    }
+    let began = Instant::now();
+    let lines = store.collect_report(usize::MAX, start);
+    println!(
+        "{:<34} {:>9?}   ({} keys, uncapped)",
+        "collect_report, whole store",
+        began.elapsed(),
+        lines.len()
+    );
+    let began = Instant::now();
+    let body = encode_report("replica-bench", &lines);
+    println!(
+        "{:<34} {:>9?}   ({} bytes)",
+        "encode_report, whole store",
+        began.elapsed(),
+        body.len()
+    );
+    std::hint::black_box(body);
+}
+
 fn main() {
     let start = Instant::now();
     let store = BucketStore::new(roomy_config());
@@ -132,4 +217,5 @@ fn main() {
     measure_apply_request_wide(&store, start);
     measure_sweep(start);
     measure_capacity_trim(start);
+    measure_report_path(start);
 }

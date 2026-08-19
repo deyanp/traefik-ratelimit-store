@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use cucumber::{given, then, when};
 
 use traefik_ratelimit_store::bucket::BucketParams;
-use traefik_ratelimit_store::peers::{PeerReport, decode_report};
+use traefik_ratelimit_store::peers::{decode_report, encode_report};
 use traefik_ratelimit_store::store::{BucketStore, KeyHash, StoreConfig};
 
 /// The caller's clock at the start of every scenario, in microseconds. Scenarios that
@@ -78,20 +78,17 @@ impl World {
         }
     }
 
-    /// One replica tells every other what it admitted, exactly as the publisher and the
-    /// peer endpoint do between them.
+    /// One replica tells every other what it admitted — the same bytes the publisher
+    /// renders, decoded the same way the peer endpoint decodes them.
     fn exchange_from(&self, index: usize, at: Instant) {
         let source = &self.replicas[index];
-        let report = PeerReport::new(
-            source.id.clone(),
-            &source.store.collect_report(usize::MAX, at),
-        );
+        let body = encode_report(&source.id, &source.store.collect_report(usize::MAX, at));
 
         for (other, replica) in self.replicas.iter().enumerate() {
             if other == index {
                 continue;
             }
-            let admissions = decode_report(report.clone(), &replica.id, usize::MAX)
+            let admissions = decode_report(&body, &replica.id, usize::MAX)
                 .expect("a report built by the store must decode");
             for (key, peer) in admissions {
                 replica.store.apply_peer_admissions(key, peer, at);
