@@ -87,7 +87,7 @@ spec:
           # The published release. IfNotPresent is safe because a version tag names one
           # image forever, and it lets a locally built image of the same name win, so
           # the development flow in the README needs no registry at all.
-          image: ghcr.io/deyanp/traefik-ratelimit-store:0.1.0
+          image: ghcr.io/deyanp/traefik-ratelimit-store:0.1.1
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsNonRoot: true

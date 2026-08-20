@@ -65,37 +65,63 @@ jobs:
           # nodes run different code under the same name.
           tags: type=semver,pattern={{version}}
 
-      - name: Build the image
-        # Built and loaded locally first so the scanner sees the real artefact. The push
-        # below is a cache hit on these same layers, so what ships is what was scanned.
+      # Each architecture is built and loaded on its own, because a scanner needs a single
+      # image to look at and `load` cannot take a manifest list. The push below is a cache
+      # hit on both of these, so what ships is exactly what was scanned. The caches are
+      # scoped per architecture; sharing one scope would make each build evict the other.
+      - name: Build for the scanner (amd64)
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
           load: true
-          tags: ${{ env.IMAGE }}:scan
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ env.IMAGE }}:scan-amd64
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
 
-      - name: Scan the image
-        # The same gate CI applies, but here it decides whether the image is published
-        # at all. A fixable critical finding stops the release with nothing pushed.
+      - name: Build for the scanner (arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: ${{ env.IMAGE }}:scan-arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+
+      # The same gate CI applies, but here it decides whether the image is published at
+      # all. A fixable critical finding stops the release with nothing pushed. Both
+      # variants are scanned rather than one taken as representative: they are separate
+      # artefacts, and only scanning both makes the published manifest list clean.
+      - name: Scan the image (amd64)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ env.IMAGE }}:scan
+          image-ref: ${{ env.IMAGE }}:scan-amd64
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan the image (arm64)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:scan-arm64
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"
 
       - name: Push the image
+        # One tag resolving to a manifest list, so amd64 nodes and arm64 nodes pull the
+        # same reference and each gets its own build.
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
 
       - name: Create the release
         # --verify-tag refuses to invent a tag if the ref disappeared underneath us.
