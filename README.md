@@ -487,11 +487,36 @@ headless one for peer discovery), a PodDisruptionBudget, topology spread, and th
 NetworkPolicy for both ports.
 
 ```sh
-docker build -t traefik-ratelimit-store:0.1.0 .
 # Without the secret the replicas refuse to start, deliberately (see Security).
-kubectl create secret generic traefik-ratelimit-store     --from-literal=peer-shared-secret="$(openssl rand -hex 32)"
+kubectl create secret generic traefik-ratelimit-store \
+    --from-literal=peer-shared-secret="$(openssl rand -hex 32)"
 kubectl apply -f deploy/traefik-ratelimit-store.yaml
 ```
+
+The manifest names the published image, so there is nothing to build first. To run your
+own build instead, tag it with that same name before applying — `IfNotPresent` prefers
+whatever is already on the node, so no registry is involved:
+
+```sh
+docker build -t ghcr.io/deyanp/traefik-ratelimit-store:0.1.0 .
+```
+
+## Releases
+
+Tagging is what publishes. `.github/workflows/release.yml` builds the image, scans it
+with the gate CI already applies, pushes it to GHCR, and writes the GitHub Release.
+
+```sh
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+The tag must match the version in `Cargo.toml` and in `deploy/traefik-ratelimit-store.yaml`.
+The workflow checks that first and stops before building anything if the three disagree.
+A fixable critical finding in the scan stops the release with nothing pushed.
+
+Images are `ghcr.io/deyanp/traefik-ratelimit-store:<version>` — one tag, one image, never
+moved, which is what makes `imagePullPolicy: IfNotPresent` safe above.
 
 ## Status
 
