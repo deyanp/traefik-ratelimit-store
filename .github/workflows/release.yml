@@ -64,6 +64,10 @@ jobs:
           # is only safe while a tag means one image forever; a moving tag would let two
           # nodes run different code under the same name.
           tags: type=semver,pattern={{version}}
+          # Restricting the tag list above is not enough on its own: the default flavor is
+          # latest=auto, which appends `latest` to any semver tag and moves it off the
+          # previous release. That is the moving tag this whole design avoids.
+          flavor: latest=false
 
       # Each architecture is built and loaded on its own, because a scanner needs a single
       # image to look at and `load` cannot take a manifest list. The push below is a cache
