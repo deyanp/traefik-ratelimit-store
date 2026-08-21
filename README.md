@@ -480,6 +480,14 @@ and the proxy retries the resulting EOF onto a healthy replica.
 the rate limiter configures it. Useful for answering a protocol question without standing
 up the whole chain. Copy it into a Traefik checkout as `conformance-probe/main.go`.
 
+**`conformance/manual-checks.md`** — curl checks to run by hand against a store already
+deployed in a cluster you keep, rather than one a script builds and deletes. Everything
+above proves the code is correct; these prove *this* deployment, with *this* `Middleware`,
+is enforcing the limit configured — that the ceiling holds, that it refills at `average`
+and no faster, that two routes sharing a middleware share one budget, and that the replicas
+agreed on one bucket. Each check also says what the wrong answer means, since the common
+failure is not a wrong number but a middleware that fell back to memory without saying so.
+
 > On Docker Desktop, the end-to-end script keeps its generated configuration inside the
 > repository rather than in a temporary directory. Docker shares only a configured set of
 > host paths and `/tmp` is usually not among them; a bind mount from an unshared path
