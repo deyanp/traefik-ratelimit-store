@@ -9,7 +9,7 @@
 //! resolves to all of them, or by an explicit list.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -27,6 +27,17 @@ use crate::store::BucketStore;
 
 /// Where a replica accepts its peers' reports.
 const REPORT_PATH: &str = "/peer-report";
+
+/// How long a resolution of the peer endpoint is reused before the name is asked again.
+///
+/// Membership changes when a replica is added, removed or replaced — a rollout, not a
+/// round — so resolving every interval buys currency the mesh has no use for, and pays
+/// for it in resolver load: at a 150 ms interval that is close to seven lookups a second
+/// from every replica, each one doubled by the A and AAAA pair and multiplied again by
+/// the search list if the configured name is not absolute. Reusing the answer bounds the
+/// staleness at one window, and a report sent to an address that has moved costs that
+/// peer the same one interval of admissions a lost report already costs it.
+const PEER_RESOLUTION_REUSE: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct PeerEndpointState {
@@ -179,6 +190,19 @@ impl PublishHealth {
     }
 }
 
+/// The addresses the last resolution returned, and when it returned them.
+#[derive(Debug)]
+struct ResolvedPeers {
+    addresses: Vec<String>,
+    resolved_at: Instant,
+}
+
+impl ResolvedPeers {
+    fn is_expired(&self, now: Instant) -> bool {
+        now.duration_since(self.resolved_at) >= PEER_RESOLUTION_REUSE
+    }
+}
+
 /// Runs the publish loop until the process ends.
 ///
 /// Never returns: a replica without a peer endpoint logs that it counts alone and then
@@ -200,16 +224,31 @@ pub async fn run_publisher(store: Arc<BucketStore>, app_env: AppEnv) {
         .expect("failed to build the peer HTTP client");
 
     let mut health = PublishHealth::default();
+    let mut resolution: Option<ResolvedPeers> = None;
     let mut ticker = tokio::time::interval(app_env.peer_publish_interval);
     loop {
         ticker.tick().await;
 
-        // Resolved once per interval and used for the whole round.
-        let peers = resolve_peers(&app_env.peer_endpoint).await;
-        health.note_resolution(peers.len());
-        if peers.is_empty() {
-            continue;
+        // The name is asked again only when the answer has aged out, or when the last
+        // round could not reach a peer.
+        if resolution
+            .as_ref()
+            .is_none_or(|resolved| resolved.is_expired(Instant::now()))
+        {
+            let addresses = resolve_peers(&app_env.peer_endpoint).await;
+            health.note_resolution(addresses.len());
+            // An answer of nothing is not kept, so the next interval asks again rather
+            // than leaving the replica counting alone for the rest of the window. That
+            // is what resolving every interval already did with a failed lookup.
+            resolution = (!addresses.is_empty()).then(|| ResolvedPeers {
+                addresses,
+                resolved_at: Instant::now(),
+            });
         }
+
+        let Some(resolved) = resolution.as_ref() else {
+            continue;
+        };
 
         let lines = store.collect_report(app_env.peer_max_keys_per_report, Instant::now());
         if lines.is_empty() {
@@ -219,8 +258,27 @@ pub async fn run_publisher(store: Arc<BucketStore>, app_env: AppEnv) {
 
         // Rendered once; each delivery shares the bytes.
         let body = Bytes::from(peers::encode_report(&app_env.replica_id, &lines));
-        let delivery = publish_once(&client, &peers, body, &app_env.peer_shared_secret).await;
-        health.note_delivery(peers.len(), delivery);
+        let peer_count = resolved.addresses.len();
+        let delivery = publish_once(
+            &client,
+            &resolved.addresses,
+            body,
+            &app_env.peer_shared_secret,
+        )
+        .await;
+        health.note_delivery(peer_count, delivery);
+
+        // A peer that did not answer at all may be gone rather than busy, and its
+        // replacement holds a different address. Discarding the resolution asks the name
+        // again on the next interval instead of waiting out the window addressing a pod
+        // that no longer exists — which is what makes a rolling update cost one failed
+        // round rather than a window of them. A peer that answered and refused is
+        // reachable, and says nothing about the addresses. A peer that is merely slow
+        // costs a lookup it did not need, and a mesh where one always is degrades to a
+        // lookup per interval: what resolving every round cost unconditionally.
+        if delivery.failed > 0 {
+            resolution = None;
+        }
     }
 }
 
@@ -437,6 +495,20 @@ mod tests {
     async fn an_unresolvable_name_yields_no_peers_rather_than_failing() {
         // A replica that cannot find its peers must keep serving, counting alone.
         assert!(resolve_peers("no-such-host.invalid:8080").await.is_empty());
+    }
+
+    #[test]
+    fn a_resolution_is_reused_until_its_window_has_passed() {
+        let start = Instant::now();
+        let resolved = ResolvedPeers {
+            addresses: vec!["10.0.0.1:8080".to_string()],
+            resolved_at: start,
+        };
+
+        assert!(!resolved.is_expired(start));
+        assert!(!resolved.is_expired(start + PEER_RESOLUTION_REUSE - Duration::from_millis(1)));
+        assert!(resolved.is_expired(start + PEER_RESOLUTION_REUSE));
+        assert!(resolved.is_expired(start + PEER_RESOLUTION_REUSE * 2));
     }
 
     #[test]

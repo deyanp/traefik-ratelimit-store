@@ -373,9 +373,9 @@ N² is prohibitive at large N. At three replicas full mesh is simpler *and* lowe
 — one hop instead of several rounds.
 
 **Every pod sends the same message to every other pod, every interval.** Per interval a
-pod resolves the headless Service, builds one payload of its own admissions, and POSTs
-that identical payload to each peer. Total messages per interval is `N × (N−1)` — six at
-three replicas, a few hundred bytes each.
+pod builds one payload of its own admissions and POSTs that identical payload to each
+peer, against the addresses the last resolution of the headless Service returned. Total
+messages per interval is `N × (N−1)` — six at three replicas, a few hundred bytes each.
 
 **Discovery is pluggable, and nothing here is Kubernetes-specific.** One environment
 variable takes either a DNS name to resolve or a comma-separated static list of peers, so
@@ -403,8 +403,23 @@ Two Services are required:
 | `traefik-ratelimit-store` | ClusterIP | 6379 (RESP) | Traefik |
 | `traefik-ratelimit-store-peers` | Headless | 8080 (HTTP) | the replicas themselves |
 
-Re-resolve every interval rather than caching — CoreDNS is node-local and this keeps
-membership current as replicas come and go. No self-exclusion is needed at resolve time:
+Reuse a resolution for two seconds rather than asking every interval. Membership changes
+when a replica is added, removed or replaced — a rollout, not a round — so resolving seven
+times a second buys currency the mesh has no use for. It is not free either: every lookup
+is an A and an AAAA query, and a configured name that is not absolute sits under the pod's
+`ndots` and drags three search-list suffixes to NXDOMAIN in front of each one, so a
+three-replica mesh can hold a node-local CoreDNS at well over a hundred queries a second
+while admitting nothing. Give the name a trailing dot and reuse the answer, and the same
+mesh costs about one lookup a second per replica.
+
+Staleness is bounded by the window, and a report sent to an address that has moved costs
+that peer the one interval of admissions a lost report already costs it. A round that
+could not reach a peer discards the resolution rather than waiting the window out: a peer
+that does not answer may be gone rather than busy, and its replacement holds a different
+address. A peer that answers and refuses is reachable, and says nothing about the
+addresses.
+
+No self-exclusion is needed at resolve time:
 a replica may POST to itself, and the inbound report is discarded because it carries the
 receiver's own `replica_id`. One loopback request per interval is cheaper than the
 machinery required to avoid it.
@@ -441,9 +456,10 @@ Nothing is cumulative, so there is no monotonicity requirement and no epoch to c
   a report cap raised past the body limit — and a mesh that silently counts alone is the
   failure this store exists to prevent. Any non-success is a rejection and is logged when
   it starts and when it clears; "no peer answered" likewise.
-- **Resolve asynchronously, once per interval.** The resolver must never hold a runtime
-  worker, because the same workers serve the protocol connections; a slow CoreDNS would
-  otherwise stall requests into the proxy's 200 ms read timeout.
+- **Resolve asynchronously, and no more often than the answer changes.** The resolver must
+  never hold a runtime worker, because the same workers serve the protocol connections; a
+  slow CoreDNS would otherwise stall requests into the proxy's 200 ms read timeout. The
+  answer is reused for two seconds, or until a delivery fails (§7.3).
 
 Switch to real gossip only if replica count passes roughly 15–20, where `N × (N−1)`
 starts to matter. At three it does not.

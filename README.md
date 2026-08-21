@@ -141,6 +141,13 @@ Everything has a working default; nothing is required.
 Nothing here is Kubernetes-specific: peer discovery is a DNS name or a static list, and the
 replica identity is a string. Under Kubernetes that DNS name is a headless Service.
 
+**End `PEER_ENDPOINT` with a dot** when it is a name. An absolute name is asked for once;
+a relative one sits under the pod's `ndots` and the resolver walks its search list to
+NXDOMAIN first — three wasted queries in front of every real one, doubled again by the A
+and AAAA pair. The name is resolved at most every two seconds, and again immediately after
+a round that could not reach a peer, so peer discovery costs the cluster resolver about
+one lookup a second per replica.
+
 A zero interval, shard count, ceiling or report cap, a delivery timeout at or beyond the
 publish interval, or a malformed number anywhere **refuses to start** with a message naming
 the variable. Each of those used to fail later, inside a background task, where nothing
@@ -498,7 +505,7 @@ own build instead, tag it with that same name before applying — `IfNotPresent`
 whatever is already on the node, so no registry is involved:
 
 ```sh
-docker buildx build --platform linux/arm64 -t ghcr.io/deyanp/traefik-ratelimit-store:0.1.1 --load .
+docker buildx build --platform linux/arm64 -t ghcr.io/deyanp/traefik-ratelimit-store:0.1.2 --load .
 ```
 
 Name the platform your nodes actually run. The build stage compiles on the builder's own
@@ -512,8 +519,8 @@ Tagging is what publishes. `.github/workflows/release.yml` builds the image, sca
 with the gate CI already applies, pushes it to GHCR, and writes the GitHub Release.
 
 ```sh
-git tag -a v0.1.1 -m "v0.1.1"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "v0.1.2"
+git push origin v0.1.2
 ```
 
 The tag must match the version in `Cargo.toml` and in `deploy/traefik-ratelimit-store.yaml`.
