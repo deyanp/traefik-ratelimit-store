@@ -505,7 +505,7 @@ own build instead, tag it with that same name before applying — `IfNotPresent`
 whatever is already on the node, so no registry is involved:
 
 ```sh
-docker buildx build --platform linux/arm64 -t ghcr.io/deyanp/traefik-ratelimit-store:0.1.2 --load .
+docker buildx build --platform linux/arm64 -t ghcr.io/deyanp/traefik-ratelimit-store:0.1.3 --load .
 ```
 
 Name the platform your nodes actually run. The build stage compiles on the builder's own
@@ -519,8 +519,8 @@ Tagging is what publishes. `.github/workflows/release.yml` builds the image, sca
 with the gate CI already applies, pushes it to GHCR, and writes the GitHub Release.
 
 ```sh
-git tag -a v0.1.2 -m "v0.1.2"
-git push origin v0.1.2
+git tag -a v0.1.3 -m "v0.1.3"
+git push origin v0.1.3
 ```
 
 The tag must match the version in `Cargo.toml` and in `deploy/traefik-ratelimit-store.yaml`.

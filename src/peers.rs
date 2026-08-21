@@ -147,7 +147,9 @@ pub fn decode_report(
     }
 
     let mut admissions = Vec::with_capacity(count);
-    for record in records.chunks_exact(RECORD_BYTES) {
+    // The length was checked to be an exact multiple, so the remainder is empty.
+    let (records, _) = records.as_chunks::<RECORD_BYTES>();
+    for record in records {
         let mut cursor = 0;
         let key = KeyHash::from_bytes(take::<16>(record, &mut cursor));
         let admitted = u32::from_le_bytes(take::<4>(record, &mut cursor));
