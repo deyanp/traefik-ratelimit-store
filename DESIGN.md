@@ -711,11 +711,13 @@ Cucumber features for behaviour, per the house Rust testing conventions.
 
 | Item | What | State |
 |---|---|---|
-| Issue A + PR | Reclaim expired buckets as the map is used | Written, verified, not filed |
-| Issue B | Per-router vs per-middleware scoping, opt-in field | Drafted, not filed |
-| [PR #13529](https://github.com/traefik/traefik/pull/13529) | `denyOnError` for the Redis limiter | Open upstream, `status/2-needs-review` |
+| [#13704](https://github.com/traefik/traefik/issues/13704) + [PR #13705](https://github.com/traefik/traefik/pull/13705) | Reclaim expired buckets as the map is used | Open, `status/2-needs-review`, targets `v3.7` |
+| [#13706](https://github.com/traefik/traefik/issues/13706) + [PR #13823](https://github.com/traefik/traefik/pull/13823) | Per-router vs per-middleware scoping, opt-in `scope` field | Open, `status/2-needs-review`, milestone `next` |
+| [PR #13916](https://github.com/traefik/traefik/pull/13916) | `denyOnError` for the Redis limiter; supersedes [#13529](https://github.com/traefik/traefik/pull/13529) | Open, `status/2-needs-review`, milestone `next` |
 
-**#13529 is the one that matters most.** It converts a shim outage from "500s on every
+State as of 2026-11-11. Milestone `next` is the release after 3.8.
+
+**#13916 is the one that matters most.** It converts a shim outage from "500s on every
 rate-limited route" into "temporarily unlimited", which for abuse protection is
 unambiguously the better failure. Without it, adopting any external store means accepting
 fail-closed on the critical path.

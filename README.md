@@ -547,9 +547,9 @@ including the decision record and the conditions under which this should not be 
 all.
 
 Production deployment is gated on one upstream change. Traefik has no `denyOnError` for its rate-limit
-middleware, so any store error becomes a 500 — [PR #13529] adds it. Until that lands,
+middleware, so any store error becomes a 500 — [PR #13916] adds it. Until that lands,
 adopting this, or any external store, means accepting fail-closed on the request path.
 
 [#13704]: https://github.com/traefik/traefik/issues/13704
 [#13706]: https://github.com/traefik/traefik/issues/13706
-[PR #13529]: https://github.com/traefik/traefik/pull/13529
+[PR #13916]: https://github.com/traefik/traefik/pull/13916
