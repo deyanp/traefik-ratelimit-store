@@ -65,9 +65,14 @@ directly. A miss is still served — refusing would turn a proxy upgrade into an
 it logs `ScriptDiverged` so an algorithm change is noticed rather than silently served with
 stale semantics.
 
-The set has more than one member for a reason. Between Traefik v3.7.1 and later v3.7 the
-script gained one space before the final `tostring(tokens)`: semantically nothing, entirely
-different digest. A fleet part-way through an upgrade sends both. Comparison stays
+The set has more than one member for a reason. Traefik edits this script in patch
+releases: v3.7.6 added one space before the final `tostring(tokens)`, and v3.7.14 replaced
+the deprecated `table.maxn(rl_source)` with `#rl_source`. Neither changes the arithmetic,
+and each gives a new digest. A fleet part-way through an upgrade sends more than one. Each
+entry is named for the first release that ships its text, and the conformance tests run
+every entry in Lua 5.1 against the native arithmetic. A Traefik release that changes the
+text needs a store release that adds it; until then the store serves the request and logs
+`ScriptDiverged`. Comparison stays
 exact-match — normalising whitespace would also make it blind to a real change, which is
 the one thing the check exists to catch.
 

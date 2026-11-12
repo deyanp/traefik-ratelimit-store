@@ -111,14 +111,19 @@ self-validating registry for free:
 
 ### 4.1 Pin a set, not a single text
 
-Between v3.7.1 and later v3.7 the script gained one space before the final
-`tostring(tokens)` — semantically nothing, entirely different digest. The accessor changed
-too (`AllowTokenBucketScript` became `LoadTokenBucketScript`, a `sync.OnceValues` so Hub
-can override it), which is a reminder that this file is actively edited.
+In v3.7.6 the script gained one space before the final `tostring(tokens)` — semantically
+nothing, entirely different digest. In v3.7.14 `table.maxn(rl_source)` became
+`#rl_source` (Traefik commit 674284427, because `table.maxn` is deprecated); for the dense
+array `HGETALL` returns, both give the length, so the arithmetic is again unchanged. The
+accessor changed too (`AllowTokenBucketScript` became `LoadTokenBucketScript`, a
+`sync.OnceValues` so Hub can override it), which is a reminder that this file is actively
+edited.
 
-So a single pinned copy is wrong on arrival: two patch releases of one minor version
-disagree, and a fleet part-way through an upgrade sends both digests. `KNOWN_SCRIPTS` is a
-set, one entry per upstream revision, each named.
+So a single pinned copy is wrong on arrival: patch releases of one minor version disagree,
+and a fleet part-way through an upgrade sends more than one digest. `KNOWN_SCRIPTS` is a
+set, one entry per upstream revision, each named for the first release that ships it. The
+conformance tests run every entry in Lua 5.1 against the native arithmetic, so a text joins
+the set only with that proof.
 
 Comparison stays **exact-match**. Normalising whitespace before comparing would absorb the
 harmless differences seen so far, and would equally absorb a real change to the arithmetic

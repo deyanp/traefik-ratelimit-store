@@ -6,11 +6,13 @@
 //!
 //! The interpreter is a dev-dependency and never reaches the binary — implementing the
 //! arithmetic natively is the whole design, and this is what proves the native version
-//! earned it. Lua 5.1 specifically: the script calls `table.maxn`, removed in 5.2.
+//! earned it. Lua 5.1 specifically: the texts before v3.7.14 call `table.maxn`, removed in
+//! 5.2.
 //!
-//! The script text executed here is the `PINNED_SCRIPT` constant from `script.rs`, so a
-//! bad transcription of the reference into this repository fails the test rather than
-//! lurking behind a digest comparison that only ever compares it to itself.
+//! Every test runs every text in `KNOWN_SCRIPTS` from `script.rs`. The store serves a text
+//! as known only when this suite shows its arithmetic matches that text, and a bad
+//! transcription of a reference fails here rather than lurking behind a digest comparison
+//! that only ever compares it to itself.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,7 +21,7 @@ use std::rc::Rc;
 use mlua::{Lua, Value, Variadic};
 
 use crate::bucket::{self, BucketParams, BucketState};
-use crate::script::PINNED_SCRIPT;
+use crate::script::KNOWN_SCRIPTS;
 
 /// What the reference returns for one request.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,13 +33,15 @@ struct ReferenceOutcome {
 /// The reference implementation, executing the real script against a stubbed store.
 struct Oracle {
     lua: Lua,
+    /// The script text this oracle executes: one entry of `KNOWN_SCRIPTS`.
+    script: &'static str,
     /// Field values exactly as the reference would hold them: strings, because that is
     /// what a store round-trip produces and it is lossy in a way that matters here.
     entries: Rc<RefCell<HashMap<String, (String, String)>>>,
 }
 
 impl Oracle {
-    fn new() -> Self {
+    fn new(script: &'static str) -> Self {
         let lua = Lua::new();
         let entries: Rc<RefCell<HashMap<String, (String, String)>>> =
             Rc::new(RefCell::new(HashMap::new()));
@@ -94,7 +98,11 @@ impl Oracle {
         redis.set("call", call).expect("set redis.call");
         lua.globals().set("redis", redis).expect("set redis");
 
-        Self { lua, entries }
+        Self {
+            lua,
+            script,
+            entries,
+        }
     }
 
     /// Runs one request through the reference.
@@ -118,7 +126,7 @@ impl Oracle {
 
         let returned: mlua::Table = self
             .lua
-            .load(PINNED_SCRIPT)
+            .load(self.script)
             .eval()
             .expect("the reference script must run");
 
@@ -190,6 +198,18 @@ fn parameter_sets() -> Vec<(f64, f64, f64)> {
     ]
 }
 
+/// Every known script text against every parameter set: the store must match each text.
+fn reference_cases() -> Vec<(&'static str, &'static str, f64, f64, f64)> {
+    KNOWN_SCRIPTS
+        .iter()
+        .flat_map(|&(revision, script)| {
+            parameter_sets()
+                .into_iter()
+                .map(move |(rate, burst, max_delay)| (revision, script, rate, burst, max_delay))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,8 +227,8 @@ mod tests {
 
     #[test]
     fn each_step_matches_the_reference() {
-        for (rate, burst, max_delay) in parameter_sets() {
-            let oracle = Oracle::new();
+        for (revision, script, rate, burst, max_delay) in reference_cases() {
+            let oracle = Oracle::new(script);
             let mut corpus = Corpus(0x5EED);
             let mut now = START;
 
@@ -224,13 +244,13 @@ mod tests {
 
                 assert!(
                     agrees(actual.wait, expected.wait),
-                    "rate {rate} burst {burst} step {step}: wait {} vs reference {}",
+                    "{revision} rate {rate} burst {burst} step {step}: wait {} vs reference {}",
                     actual.wait,
                     expected.wait
                 );
                 assert!(
                     agrees(actual.state.tokens, expected.tokens),
-                    "rate {rate} burst {burst} step {step}: tokens {} vs reference {}",
+                    "{revision} rate {rate} burst {burst} step {step}: tokens {} vs reference {}",
                     actual.state.tokens,
                     expected.tokens
                 );
@@ -243,8 +263,8 @@ mod tests {
         // The number the caller acts on is the delay, compared against max_delay. A
         // disagreement in the last digits is tolerable; a disagreement about which side of
         // that threshold a request falls on is not, because it changes the response.
-        for (rate, burst, max_delay) in parameter_sets() {
-            let oracle = Oracle::new();
+        for (revision, script, rate, burst, max_delay) in reference_cases() {
+            let oracle = Oracle::new(script);
             let mut corpus = Corpus(0xC0FFEE);
             let mut now = START;
 
@@ -259,7 +279,7 @@ mod tests {
                 assert_eq!(
                     actual.wait <= max_delay,
                     expected.wait <= max_delay,
-                    "rate {rate} burst {burst} step {step}: admission differs ({} vs {})",
+                    "{revision} rate {rate} burst {burst} step {step}: admission differs ({} vs {})",
                     actual.wait,
                     expected.wait
                 );
@@ -283,8 +303,8 @@ mod tests {
         // That error is re-derived from the stored value each step rather than compounding,
         // so the correct assertion is that this store never drifts further from the
         // reference than the reference's own precision explains.
-        for (rate, burst, max_delay) in parameter_sets() {
-            let oracle = Oracle::new();
+        for (revision, script, rate, burst, max_delay) in reference_cases() {
+            let oracle = Oracle::new(script);
             let mut corpus = Corpus(0xBEEF);
             let mut now = START;
             let mut carried: Option<BucketState> = None;
@@ -308,7 +328,7 @@ mod tests {
 
                 assert!(
                     (actual.state.tokens - expected.tokens).abs() <= tolerance,
-                    "rate {rate} burst {burst} step {step}: drifted to {} against reference {} \
+                    "{revision} rate {rate} burst {burst} step {step}: drifted to {} against reference {} \
                      (gap {:e}, a thousandth of burst is {:e})",
                     actual.state.tokens,
                     expected.tokens,
@@ -324,20 +344,25 @@ mod tests {
         // Records the reason the test above tolerates what it does. If a future release
         // stores the bucket some other way, this fails and the tolerance is revisited
         // rather than silently over-permitting a real divergence.
-        let oracle = Oracle::new();
-        let step_params = params(3.0, 10.0, 166_666.0, START + 12_345.0);
+        for (revision, script) in KNOWN_SCRIPTS {
+            let oracle = Oracle::new(script);
+            let step_params = params(3.0, 10.0, 166_666.0, START + 12_345.0);
 
-        oracle.apply_request("k", &step_params);
-        let stored = oracle
-            .stored_state("k")
-            .expect("the reference stored the bucket");
+            oracle.apply_request("k", &step_params);
+            let stored = oracle
+                .stored_state("k")
+                .expect("the reference stored the bucket");
 
-        assert_ne!(
-            stored.last, step_params.now,
-            "the reference is expected to lose precision storing the timestamp"
-        );
-        // Within one granularity unit: lossy, but only in the last digits.
-        assert!((stored.last - step_params.now).abs() < step_params.now * 1e-12);
+            assert_ne!(
+                stored.last, step_params.now,
+                "{revision}: the reference is expected to lose precision storing the timestamp"
+            );
+            // Within one granularity unit: lossy, but only in the last digits.
+            assert!(
+                (stored.last - step_params.now).abs() < step_params.now * 1e-12,
+                "{revision}: the stored timestamp is off by more than its last digits"
+            );
+        }
     }
 
     #[test]
@@ -345,29 +370,45 @@ mod tests {
         // The surprising case, and the one an implementation is most likely to get wrong:
         // a missing entry reads as last = 0, so the elapsed time is the whole timestamp
         // and the bucket arrives full rather than empty.
-        for (rate, burst, max_delay) in parameter_sets() {
-            let oracle = Oracle::new();
+        for (revision, script, rate, burst, max_delay) in reference_cases() {
+            let oracle = Oracle::new(script);
             let step_params = params(rate, burst, max_delay, START);
 
             let expected = oracle.apply_request("fresh", &step_params);
             let actual = bucket::apply_request(None, &step_params);
 
-            assert!(agrees(actual.state.tokens, expected.tokens));
-            assert!(agrees(actual.wait, expected.wait));
-            assert!(agrees(actual.state.tokens, burst - 1.0));
+            assert!(
+                agrees(actual.state.tokens, expected.tokens),
+                "{revision} rate {rate} burst {burst}: tokens {} vs reference {}",
+                actual.state.tokens,
+                expected.tokens
+            );
+            assert!(
+                agrees(actual.wait, expected.wait),
+                "{revision} rate {rate} burst {burst}: wait {} vs reference {}",
+                actual.wait,
+                expected.wait
+            );
+            assert!(
+                agrees(actual.state.tokens, burst - 1.0),
+                "{revision} rate {rate} burst {burst}: a fresh bucket holds {} tokens",
+                actual.state.tokens
+            );
         }
     }
 
     #[test]
-    fn the_pinned_script_is_the_one_being_executed() {
-        // Guards the premise of every assertion above: if PINNED_SCRIPT were mistranscribed
+    fn each_known_script_is_the_one_being_executed() {
+        // Guards the premise of every assertion above: if a known text were mistranscribed
         // it would still hash consistently and the registry would still accept it, but the
         // oracle would be validating this store against the wrong reference.
-        let oracle = Oracle::new();
+        for (revision, script) in KNOWN_SCRIPTS {
+            let oracle = Oracle::new(script);
 
-        let outcome = oracle.apply_request("k", &params(3.0, 10.0, 166_666.0, START));
+            let outcome = oracle.apply_request("k", &params(3.0, 10.0, 166_666.0, START));
 
-        assert_eq!(outcome.tokens, 9.0);
-        assert_eq!(outcome.wait, 0.0);
+            assert_eq!(outcome.tokens, 9.0, "{revision}: tokens after one request");
+            assert_eq!(outcome.wait, 0.0, "{revision}: wait after one request");
+        }
     }
 }

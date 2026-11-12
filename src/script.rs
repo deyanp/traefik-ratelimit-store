@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use sha1::{Digest, Sha1};
 
-/// The script text this store's arithmetic reproduces, as published in v3.7.1.
+/// The script text this store's arithmetic reproduces, as published from v3.7.1 through
+/// v3.7.5.
 ///
 /// Compared byte for byte; never executed.
 pub const PINNED_SCRIPT: &str = r#"
@@ -65,7 +66,7 @@ redis.call('expire', key, ttl)
 
 return {tostring(true), tostring(wait_duration),tostring(tokens)}"#;
 
-/// The same algorithm as published later on the v3.7 branch.
+/// The same algorithm as published from v3.7.6 through v3.7.13.
 ///
 /// It differs from [`PINNED_SCRIPT`] by one space before the final `tostring(tokens)`,
 /// which is semantically nothing and a completely different digest. This is why the
@@ -116,6 +117,57 @@ redis.call('expire', key, ttl)
 
 return {tostring(true), tostring(wait_duration), tostring(tokens)}"#;
 
+/// The same algorithm as published from v3.7.14, and on `master`.
+///
+/// It differs from [`PINNED_SCRIPT_SPACED_RETURN`] in one line: `#rl_source == 4` replaces
+/// `table.maxn(rl_source) == 4`, because `table.maxn` is deprecated. `HGETALL` returns a
+/// dense array, so both give its length, and the arithmetic is the same. The conformance
+/// suite runs this text in Lua 5.1 as it runs the others.
+pub const PINNED_SCRIPT_LENGTH_OPERATOR: &str = r#"
+local key = KEYS[1]
+local limit, burst, ttl, t, max_delay = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4]),
+    tonumber(ARGV[5])
+
+local bucket = {
+    limit = limit,
+    burst = burst,
+    tokens = 0,
+    last = 0
+}
+
+local rl_source = redis.call('hgetall', key)
+
+if #rl_source == 4 then
+    -- Get bucket state from redis
+    bucket.last = tonumber(rl_source[2])
+    bucket.tokens = tonumber(rl_source[4])
+end
+
+local last = bucket.last
+if t < last then
+    last = t
+end
+
+local elapsed = t - last
+local delta = bucket.limit * elapsed
+local tokens = bucket.tokens + delta
+tokens = math.min(tokens, bucket.burst)
+tokens = tokens - 1
+
+local wait_duration = 0
+if tokens < 0 then
+    wait_duration = (tokens * -1) / bucket.limit
+    if wait_duration > max_delay then
+        tokens = tokens + 1
+        tokens = math.min(tokens, burst)
+    end
+end
+
+redis.call('hset', key, 'last', t, 'tokens', tokens)
+redis.call('expire', key, ttl)
+
+return {tostring(true), tostring(wait_duration), tostring(tokens)}"#;
+
 /// Every script text known to express the arithmetic this store implements.
 ///
 /// Membership is exact-match on purpose. Normalising whitespace before comparing would
@@ -123,9 +175,12 @@ return {tostring(true), tostring(wait_duration), tostring(tokens)}"#;
 /// it tolerant of a real change to the algorithm — which is the one thing the comparison
 /// exists to catch. Adding a revision here is a deliberate act that says someone read the
 /// diff.
+///
+/// Each entry is named for the first Traefik release that ships its text.
 pub const KNOWN_SCRIPTS: &[(&str, &str)] = &[
     ("v3.7.1", PINNED_SCRIPT),
-    ("v3.7-branch", PINNED_SCRIPT_SPACED_RETURN),
+    ("v3.7.6", PINNED_SCRIPT_SPACED_RETURN),
+    ("v3.7.14", PINNED_SCRIPT_LENGTH_OPERATOR),
 ];
 
 /// How many digests of *unrecognised* sources the registry will remember.
@@ -345,6 +400,31 @@ mod tests {
             .collect();
 
         assert_eq!(digests.len(), KNOWN_SCRIPTS.len());
+    }
+
+    #[test]
+    fn each_known_text_hashes_to_the_digest_traefik_sends() {
+        // The digests are SHA-1s of `lua.go` in each release tag, computed outside this
+        // repository. A text transcribed here with one byte wrong still registers itself,
+        // because the registry only compares it with itself; this test catches that.
+        let expected = [
+            ("v3.7.1", "a82138cfb0cc9aa6e05d666c1f912744aefbe711"),
+            ("v3.7.6", "3d93177e9b9a18f241edddc8d7e7fa1c47ae4eb6"),
+            ("v3.7.14", "7d2a5c0821964964e7f36858db0f3c4a49951c4d"),
+        ];
+
+        let actual: Vec<(&str, String)> = KNOWN_SCRIPTS
+            .iter()
+            .map(|(revision, source)| (*revision, compute_digest(source.as_bytes())))
+            .collect();
+
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|(revision, digest)| (*revision, digest.to_string()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
