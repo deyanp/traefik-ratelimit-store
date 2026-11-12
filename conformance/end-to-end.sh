@@ -104,8 +104,10 @@ echo "Waiting for the route to come up..."
 # Traefik answers before its file provider has loaded the router, so anything but the
 # route's own statuses — 200, or 429 once the probes have spent the burst — means keep
 # waiting. Breaking on the first non-000 reply used to let 404s leak into the measurement.
+# Before the port answers, curl exits non-zero (52, empty reply), and under set -e that ended
+# the script here. `|| true` keeps the 000 that -w has already printed, so the loop waits.
 for _ in $(seq 1 30); do
-    status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/)
+    status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/ || true)
     case "$status" in
         200|429) break ;;
     esac
@@ -118,7 +120,7 @@ admitted=0
 refused=0
 other=0
 for _ in $(seq 1 "$requests"); do
-    status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/)
+    status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/ || true)
     case "$status" in
         200) admitted=$((admitted + 1)) ;;
         429) refused=$((refused + 1)) ;;

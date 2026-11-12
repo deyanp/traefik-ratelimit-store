@@ -109,7 +109,7 @@ admitted=0
 refused=0
 other=0
 for _ in $(seq 1 20); do
-    status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$LOCAL_PORT/")
+    status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$LOCAL_PORT/" || true)
     case "$status" in
         200) admitted=$((admitted + 1)) ;;
         429) refused=$((refused + 1)) ;;
