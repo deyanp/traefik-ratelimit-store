@@ -35,6 +35,12 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    # The action reports what it finds as a check run, warnings (unsound, unmaintained)
+    # included. Without checks: write that call is refused and the job fails, even when no
+    # vulnerability was found.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v7
 
