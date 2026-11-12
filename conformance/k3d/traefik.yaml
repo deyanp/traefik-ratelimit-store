@@ -80,7 +80,7 @@ spec:
       serviceAccountName: traefik
       containers:
         - name: traefik
-          image: traefik:v3.7.10
+          image: traefik:v3.7.18
           args:
             - --entrypoints.web.address=:80
             - --providers.kubernetescrd

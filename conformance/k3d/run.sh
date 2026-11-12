@@ -19,7 +19,7 @@
 set -euo pipefail
 
 clusterName=rlstore-e2e
-traefikVersion=v3.7.10
+traefikVersion=v3.7.18
 keepCluster=false
 
 while [ $# -gt 0 ]; do
@@ -137,6 +137,20 @@ fi
 if [ "$admitted" -gt "$ceiling" ]; then
     echo "FAILED: $admitted admitted against a burst of 5 across $replicas replicas —"
     echo "        the counters are not being shared"
+    exit 1
+fi
+
+# The store serves a script it does not know, so the counts above pass either way. The logs
+# say whether Traefik $traefikVersion sent a text in KNOWN_SCRIPTS (src/script.rs). A label
+# selector shows only the last 10 lines of each pod unless --tail says otherwise.
+storeLog=$(kubectl --context "$CONTEXT" logs -l app=traefik-ratelimit-store --tail=-1 --prefix)
+if [[ "$storeLog" == *ScriptDiverged* ]]; then
+    echo "FAILED: Traefik $traefikVersion sent a script text the store does not know"
+    echo "        (ScriptDiverged). Add its text to KNOWN_SCRIPTS in src/script.rs."
+    exit 1
+fi
+if [[ "$storeLog" != *ScriptRegistered* ]]; then
+    echo "FAILED: no replica registered Traefik's script (no ScriptRegistered)"
     exit 1
 fi
 echo "PASSED: $replicas replicas enforced one shared limit behind real Traefik"

@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-traefikVersion=v3.7.10
+traefikVersion=v3.7.18
 requests=20
 
 while [ $# -gt 0 ]; do
@@ -132,7 +132,8 @@ echo "refused  (429): $refused"
 echo "other:          $other"
 echo ""
 echo "Store log:"
-docker logs rlstore-store 2>&1 | tail -5
+storeLog=$(docker logs rlstore-store 2>&1)
+echo "$storeLog" | tail -5
 
 echo ""
 if [ "$other" -ne 0 ]; then
@@ -145,6 +146,17 @@ if [ "$admitted" -eq 0 ]; then
 fi
 if [ "$refused" -eq 0 ]; then
     echo "FAILED: nothing was refused, so the limit was not enforced"
+    exit 1
+fi
+# The store serves a script it does not know, so the counts above pass either way. The log
+# says whether Traefik $traefikVersion sent a text in KNOWN_SCRIPTS (src/script.rs).
+if [[ "$storeLog" == *ScriptDiverged* ]]; then
+    echo "FAILED: Traefik $traefikVersion sent a script text the store does not know"
+    echo "        (ScriptDiverged). Add its text to KNOWN_SCRIPTS in src/script.rs."
+    exit 1
+fi
+if [[ "$storeLog" != *ScriptRegistered* ]]; then
+    echo "FAILED: the store never registered Traefik's script (no ScriptRegistered)"
     exit 1
 fi
 echo "PASSED: real Traefik enforced a shared limit through this store"
