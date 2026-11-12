@@ -72,8 +72,16 @@ echo "Deploying the store from deploy/..."
 kubectl --context "$CONTEXT" create secret generic traefik-ratelimit-store \
     --from-literal=peer-shared-secret="$(openssl rand -hex 32)" > /dev/null
 
-sed "s|image: traefik-ratelimit-store:.*|image: $IMAGE|" "$ROOT/deploy/traefik-ratelimit-store.yaml" \
-    | kubectl --context "$CONTEXT" apply -f - > /dev/null
+# The manifest names the published image (ghcr.io/...); this test runs the build above.
+# A pattern that misses the image line leaves the published one in place, and the test then
+# passes or fails for code it never built, so a rendered manifest without $IMAGE stops here.
+storeManifest=$(sed "s|image: .*traefik-ratelimit-store:.*|image: $IMAGE|" \
+    "$ROOT/deploy/traefik-ratelimit-store.yaml")
+if [[ "$storeManifest" != *"image: $IMAGE"* ]]; then
+    echo "FAILED: could not point deploy/traefik-ratelimit-store.yaml at the local build $IMAGE"
+    exit 1
+fi
+echo "$storeManifest" | kubectl --context "$CONTEXT" apply -f - > /dev/null
 
 echo "Deploying Traefik and the workload..."
 sed "s|image: traefik:.*|image: traefik:$traefikVersion|" "$HERE/traefik.yaml" \
